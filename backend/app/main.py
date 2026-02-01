@@ -1,5 +1,4 @@
-import re
-from dateparser.search import search_dates
+from services.scheduling import extract_date_from_text, find_available_slot, find_time_slot, infer_duration_minutes
 from fastapi import FastAPI
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,8 +8,9 @@ from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session
 
-from db import get_db
-from models import TaskBase, Task, Mood, Reflection, NLTaskCreate
+from app.db import get_db
+from app.schemas import ChatInput, TaskBase, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, NLTaskCreate, TaskCreate, TaskResponse
+from app.models import Task, Mood, Reflection
 
 app = FastAPI(title="AI Life Planner")
 
@@ -20,72 +20,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-class TaskCreate(TaskBase):
-    pass
-
-class TaskResponse(TaskBase):
-    id: int
-    completed: bool
-
-    class Config:
-        orm_mode = True
-
-class MoodCreate(BaseModel):
-    date: date
-    mood: int
-    energy: int
-    note: Optional[str] = None
-
-class MoodResponse(MoodCreate):
-    id: int
-
-    class Config:
-        orm_mode = True
-
-class ReflectionCreate(BaseModel):
-    date: date
-    text: str
-
-class ReflectionResponse(ReflectionCreate):
-    id: int
-
-    class Config:
-        orm_mode = True
-
-
-WORK_START = time(9, 0)  # 9:00 AM
-WORK_END = time(21, 0)   # 9:00 PM
-DEFAULT_DURATION_MINUTES = 60  # default task duration
-
-def find_time_slot(task_date: date, db: Session, duration_minutes: int = DEFAULT_DURATION_MINUTES):
-    """
-    Find the first available time slot for the task on task_date.
-    Simple greedy algorithm: fills earliest free slot.
-    """
-    existing_tasks = db.query(Task).filter(Task.date == task_date).all()
-    existing_tasks = sorted(existing_tasks, key=lambda t: t.start_time or WORK_START)
-
-    # Start searching from WORK_START
-    current_start = datetime.combine(task_date, WORK_START)
-    work_end_dt = datetime.combine(task_date, WORK_END)
-    duration_td = timedelta(minutes=duration_minutes)
-
-    for task in existing_tasks:
-        task_start = datetime.combine(task_date, task.start_time or WORK_START)
-        task_end = datetime.combine(task_date, task.end_time) if task.end_time else task_start + duration_td
-        if current_start + duration_td <= task_start:
-            # Found a gap
-            return current_start.time(), (current_start + duration_td).time()
-        current_start = max(current_start, task_end)
-        
-        # If no gaps, place at the end of workday
-    if current_start + duration_td <= work_end_dt:
-        return current_start.time(), (current_start + duration_td).time()
-
-    # If fully booked, just return WORK_START slot (overlap)
-    return WORK_START, (datetime.combine(task_date, WORK_START) + duration_td).time()
-
 
 @app.get("/health")
 def health_check():
@@ -100,40 +34,44 @@ def create_task(task: TaskCreate, db: Session = Depends(get_db)):
     return db_task
 
 @app.post("/tasks/nl", response_model=TaskResponse)
-def create_task_nl(nl_task: NLTaskCreate, db: Session = Depends(get_db)):
-    text = nl_task.text
-    results = search_dates(
-        text,
-        settings={
-            'PREFER_DATES_FROM': 'future',
-            'RELATIVE_BASE': datetime.now(), # Use current time for better relative accuracy
-            'TIMEZONE': 'America/Los_Angeles',
-            'RETURN_AS_TIMEZONE_AWARE': False
-        }
-    )
+def create_task_from_nl(
+    input: NLTaskCreate,
+    db: Session = Depends(get_db)
+):
+    text = input.text
 
-    if results:
-        # results[0][1] is the datetime object of the first date found
-        parsed_dt = results[0][1]
-        task_date = parsed_dt.date()
-    else:
-        # Fallback to today if no date is mentioned
-        task_date = date.today()
+    task_date = extract_date_from_text(text)
 
-    start_time, end_time = find_time_slot(task_date, db)
-    title = text[:50]
+    mood = db.query(Mood).filter(Mood.date == task_date).first()
+    energy = mood.energy if mood else 3
 
-    db_task = Task(
-        title=title,
+    start_time, end_time = find_time_slot(task_date, db, energy)
+
+    task = Task(
+        title=text.capitalize(),
         date=task_date,
         start_time=start_time,
-        end_time=end_time
+        end_time=end_time,
+        completed=False
     )
-    print(text, "->", task_date)
-    db.add(db_task)
+
+    db.add(task)
     db.commit()
-    db.refresh(db_task)
-    return db_task
+    db.refresh(task)
+
+    return task
+
+def infer_priority(text: str):
+    text = text.lower()
+
+    if any(word in text for word in ["urgent", "asap", "important", "critical"]):
+        return 5
+    if any(word in text for word in ["high priority", "must", "deadline"]):
+        return 4
+    if any(word in text for word in ["low priority", "optional", "if possible"]):
+        return 2
+
+    return 3
 
 @app.post("/mood", response_model=MoodResponse)
 def create_mood(mood: MoodCreate, db: Session = Depends(get_db)):
@@ -161,6 +99,55 @@ def create_reflection(
     db.refresh(db_reflection)
     return db_reflection
 
+@app.post("/chat", response_model=TaskResponse)
+def chat_create_task(
+    input: ChatInput,
+    db: Session = Depends(get_db)
+):
+    text = input.message
+
+    # 1. Extract date from natural language
+    task_date = extract_date_from_text(text)
+
+    # 2. Fetch mood & energy (default = neutral)
+    mood = db.query(Mood).filter(Mood.date == task_date).first()
+    energy = mood.energy if mood else 3
+    duration_min = infer_duration_minutes(text)
+    # 3. Assign time slot based on energy
+    priority = infer_priority(text)
+    deadline = extract_date_from_text(text)
+
+    start_time, end_time = find_available_slot(
+        task_date,
+        energy,
+        db,
+        duration_min,
+        deadline
+    )
+
+    if not start_time:
+        raise HTTPException(
+            status_code=409,
+            detail="No available time slot for this day"
+        )
+
+    # 4. Create task
+    task = Task(
+        title=text.capitalize(),
+        date=task_date,
+        start_time=start_time,
+        end_time=end_time,
+        completed=False,
+        priority=priority,
+        deadline=deadline
+    )
+
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    return task
+
 @app.get("/tasks", response_model=List[TaskResponse])
 def get_tasks(task_date: date, db: Session = Depends(get_db)):
     return db.query(Task).filter(Task.date == task_date).all()
@@ -183,8 +170,33 @@ def get_reflection(date: date, db: Session = Depends(get_db)):
 @app.get("/schedule/{schedule_date}", response_model=List[TaskResponse])
 def get_schedule(schedule_date: date, db: Session = Depends(get_db)):
     tasks = db.query(Task).filter(Task.date == schedule_date).all()
-    # simple prioritization: incomplete first
-    tasks.sort(key=lambda t: (t.completed, t.start_time or datetime.min.time()))
+    
+    today_mood = db.query(Mood).filter(Mood.date == schedule_date).first()
+    energy = today_mood.energy if today_mood else 3  # default medium energy
+
+    def task_priority(t):
+    # Start datetime
+        start = datetime.combine(t.date, t.start_time or time(9, 0))
+        # End datetime (use end_time if exists, else 60 min duration)
+        if t.end_time:
+            end = datetime.combine(t.date, t.end_time)
+        else:
+            end = start + timedelta(minutes=60)
+        duration = (end - start).total_seconds() / 60  # duration in minutes
+
+        energy = t.energy if hasattr(t, 'energy') else 3  # fallback if needed
+
+        # Energy-based adjustment
+        if energy <= 2:
+            return duration           # low energy → short tasks first
+        elif energy >= 4:
+            return -duration          # high energy → long tasks first
+        else:
+            return start.hour*60 + start.minute  # medium energy → keep original order
+
+    # Sort tasks: incomplete first, then by priority
+    tasks.sort(key=lambda t: (t.completed, task_priority(t)))
+    
     return tasks
 
 @app.get("/reminders/{reminder_date}", response_model=List[TaskResponse])

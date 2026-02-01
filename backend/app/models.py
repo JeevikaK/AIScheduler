@@ -1,7 +1,4 @@
-from datetime import time, date
-from typing import Optional
-from pydantic import BaseModel
-from db import Base, engine
+from app.db import Base
 from sqlalchemy import (
     create_engine,
     Column,
@@ -11,6 +8,7 @@ from sqlalchemy import (
     Date,
     Time,
 )
+
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -22,6 +20,8 @@ class Task(Base):
     start_time = Column(Time, nullable=True)
     end_time = Column(Time, nullable=True)
     completed = Column(Boolean, default=False)
+    priority = Column(Integer, default=3)   # 1 (low) → 5 (high)
+    deadline = Column(Date, nullable=True)
 
 class Mood(Base):
     __tablename__ = "moods"
@@ -38,15 +38,3 @@ class Reflection(Base):
     id = Column(Integer, primary_key=True)
     date = Column(Date, unique=True)
     text = Column(String)
-
-class TaskBase(BaseModel):
-    title: str
-    description: Optional[str] = None
-    date: date
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
-
-class NLTaskCreate(BaseModel):
-    text: str
-
-Base.metadata.create_all(bind=engine)
