@@ -1,5 +1,5 @@
 from datetime import time, date
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel
 from app.db import Base, engine
 
@@ -19,6 +19,12 @@ class TaskResponse(TaskBase):
 
     class Config:
         orm_mode = True
+
+class TaskReflectionInput(BaseModel):
+    completed: bool
+    actual_duration: int  # minutes
+    energy: int           # 1–5
+    mood: Optional[str] = None
 
 class MoodCreate(BaseModel):
     date: date
@@ -42,10 +48,13 @@ class ReflectionResponse(ReflectionCreate):
     class Config:
         orm_mode = True
 
-class NLTaskCreate(BaseModel):
-    text: str
-
 class ChatInput(BaseModel):
     message: str
+
+class DailyScheduleResponse(BaseModel):
+    date: date
+    energy: int
+    message: str
+    tasks: List[TaskResponse]
 
 Base.metadata.create_all(bind=engine)

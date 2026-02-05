@@ -2,8 +2,7 @@ from datetime import date, datetime, time, timedelta
 import re
 from dateparser.search import search_dates
 from requests import Session
-from app.models import Task
-
+from app.models import DurationStats, Task
 
 WORK_START = time(9, 0)  # 9:00 AM
 WORK_END = time(21, 0)   # 9:00 PM
@@ -55,43 +54,37 @@ def extract_date_from_text(text: str):
     return date.today()
 
 
-def find_available_slot(task_date, energy, db, duration_min=60, deadline=None):
-    existing_tasks = (
-        db.query(Task)
-        .filter(Task.date == task_date)
-        .all()
-    )
+from datetime import datetime, timedelta, time
 
-    if deadline:
-        days_left = (deadline - task_date).days
-        if days_left <= 1:
-            current_start = WORK_START  # urgent → early
-        else:
-            current_start = time(9, 0)
+def find_available_slot(task_date, energy, db, duration_min=60, deadline=None, priority=None):
+    existing_tasks = db.query(Task).filter(Task.date == task_date).all()
+
+    # Determine ideal starting point based on energy/deadline
+    if deadline and (deadline - task_date).days <= 1:
+        search_start = WORK_START  # Urgent: check entire day from start
     elif energy <= 2:
-        current_start = time(16, 0)
+        search_start = time(16, 0) # Low energy: late start
     elif energy == 3:
-        current_start = time(14, 0)
+        search_start = time(14, 0) # Medium energy: mid-day
     else:
-        current_start = time(9, 0)
+        search_start = time(9, 0)  # High energy: morning
 
-    while current_start < WORK_END:
-        start_dt = datetime.combine(task_date, current_start)
-        end_dt = start_dt + timedelta(minutes=duration_min)
+    current_time = datetime.combine(task_date, search_start)
+    end_of_day = datetime.combine(task_date, WORK_END)
 
-        if end_dt.time() > WORK_END:
-            break
+    while current_time + timedelta(minutes=duration_min) <= end_of_day:
+        slot_start = current_time.time()
+        slot_end = (current_time + timedelta(minutes=duration_min)).time()
 
-        if not has_conflict(
-            start_dt.time(),
-            end_dt.time(),
-            existing_tasks
-        ):
-            return start_dt.time(), end_dt.time()
+        if not has_conflict(slot_start, slot_end, existing_tasks):
+            return slot_start, slot_end
 
-        # Move forward by 30 mins
-        current_start = (start_dt + timedelta(minutes=30)).time()
-
+        # Move forward in 30-minute increments
+        current_time += timedelta(minutes=30)
+        
+        # Safety: If we hit WORK_END and found nothing, 
+        # consider a "fallback" to search the morning if we haven't already.
+    
     return None, None
 
 def has_conflict(start, end, existing_tasks):
@@ -103,26 +96,119 @@ def has_conflict(start, end, existing_tasks):
             return True
     return False
 
-def infer_duration_minutes(text: str):
+def infer_duration_minutes(
+    text: str,
+    task_type: str | None = None,
+    energy_level: int | None = None,   # 1–5
+    historical_avg: int | None = None  # minutes from reflection loop
+):
     text = text.lower()
 
-    # Explicit durations
-    hour_match = re.search(r"(\d+)\s*hour", text)
-    if hour_match:
-        return int(hour_match.group(1)) * 60
+    # -----------------------------
+    # 1. Explicit durations (highest priority)
+    # -----------------------------
+    hours = re.findall(r"(\d+(?:\.\d+)?)\s*hour", text)
+    minutes = re.findall(r"(\d+)\s*min", text)
 
-    minute_match = re.search(r"(\d+)\s*min", text)
-    if minute_match:
-        return int(minute_match.group(1))
+    if hours:
+        return int(float(hours[0]) * 60)
 
-    # Keyword-based heuristics
-    if any(word in text for word in ["quick", "light"]):
-        return 30
+    if minutes:
+        return int(minutes[0])
 
-    if any(word in text for word in ["deep", "focus", "intense"]):
-        return 120
+    # -----------------------------
+    # 2. Deadline / urgency hints
+    # -----------------------------
+    if any(word in text for word in ["quiz", "exam", "test", "deadline", "tomorrow"]):
+        base = 120
+    else:
+        base = 60
 
-    if any(word in text for word in ["study", "assignment", "project"]):
-        return 90
+    # -----------------------------
+    # 3. Task-type heuristics
+    # -----------------------------
+    task_keywords = {
+        "study": 90,
+        "revision": 60,
+        "assignment": 120,
+        "project": 150,
+        "coding": 120,
+        "reading": 45,
+        "meeting": 30,
+        "presentation": 90,
+        "exercise": 45,
+        "errand": 30
+    }
 
-    return 60
+    for key, duration in task_keywords.items():
+        if key in text:
+            base = duration
+            break
+
+    # Optional explicit task_type from NLP
+    if task_type and task_type in task_keywords:
+        base = task_keywords[task_type]
+
+    # -----------------------------
+    # 4. Intensity modifiers
+    # -----------------------------
+    if any(word in text for word in ["quick", "light", "skim"]):
+        base -= 20
+
+    if any(word in text for word in ["deep", "focus", "intense", "thorough"]):
+        base += 30
+
+    # -----------------------------
+    # 5. Energy-based adjustment
+    # -----------------------------
+    if energy_level:
+        if energy_level <= 2:
+            base *= 1.25   # low energy → slower
+        elif energy_level >= 4:
+            base *= 0.85   # high energy → faster
+
+    # -----------------------------
+    # 6. Reflection-based override (MOST IMPORTANT long-term)
+    # -----------------------------
+    if historical_avg:
+        # Weighted blend: learned behavior > heuristics
+        base = int(0.7 * historical_avg + 0.3 * base)
+
+    # -----------------------------
+    # 7. Safety bounds
+    # -----------------------------
+    base = max(15, min(int(base), 240))  # 15 min – 4 hours
+
+    return int(base)
+
+def store_duration_delta(
+    db: Session,
+    task_type: str,
+    energy: int,
+    delta: int,
+):
+    stat = (
+        db.query(DurationStats)
+        .filter(
+            DurationStats.task_type == task_type,
+            DurationStats.energy == energy,
+        )
+        .first()
+    )
+
+    if not stat:
+        stat = DurationStats(
+            task_type=task_type,
+            energy=energy,
+            avg_delta=delta,
+            count=1,
+        )
+        db.add(stat)
+    else:
+        # running average
+        stat.avg_delta = int(
+            (stat.avg_delta * stat.count + delta) / (stat.count + 1)
+        )
+        stat.count += 1
+
+    db.commit()

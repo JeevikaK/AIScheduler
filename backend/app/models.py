@@ -22,6 +22,9 @@ class Task(Base):
     completed = Column(Boolean, default=False)
     priority = Column(Integer, default=3)   # 1 (low) → 5 (high)
     deadline = Column(Date, nullable=True)
+    actual_duration = Column(Integer, nullable=True)
+    reflection_energy = Column(Integer, nullable=True)  # 1–5
+    reflection_mood = Column(String, nullable=True)
 
 class Mood(Base):
     __tablename__ = "moods"
@@ -38,3 +41,12 @@ class Reflection(Base):
     id = Column(Integer, primary_key=True)
     date = Column(Date, unique=True)
     text = Column(String)
+
+class DurationStats(Base):
+    __tablename__ = "duration_stats"
+
+    id = Column(Integer, primary_key=True)
+    task_type = Column(String, index=True)
+    energy = Column(Integer)  # 1–5
+    avg_delta = Column(Integer, default=0)
+    count = Column(Integer, default=0)
