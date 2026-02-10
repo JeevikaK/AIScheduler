@@ -3,9 +3,7 @@ from google import genai
 from google.genai import types
 
 class GoogleADKClient:
-    def __init__(self, model_name="gemini-2.5-flash-lite"):  # Updated to a 2.0+ stable model
-        # The new SDK looks for GEMINI_API_KEY by default, 
-        # but we'll manually pull GOOGLE_API_KEY if that's what you're using.
+    def __init__(self, model_name="gemini-2.5-flash-lite"):
         api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         
         if not api_key:
@@ -15,7 +13,6 @@ class GoogleADKClient:
         self.model_name = model_name
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
-        # Note: The new SDK uses 'contents' (plural) for the main prompt
         response = self.client.models.generate_content(
             model=self.model_name,
             contents=user_prompt,
