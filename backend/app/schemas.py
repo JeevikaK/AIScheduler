@@ -10,9 +10,14 @@ class TaskBase(BaseModel):
     start_time: Optional[time] = None
     end_time: Optional[time] = None
 
-class TaskCreate(TaskBase):
-    pass
 
+class TaskCreate(BaseModel):
+    title: str
+    date: date
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    priority: int = 1
+    
 class TaskResponse(TaskBase):
     id: int
     completed: bool
