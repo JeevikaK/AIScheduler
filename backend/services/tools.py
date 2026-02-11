@@ -22,12 +22,13 @@ def infer_priority(text: str):
 
     return 3
 
-def create_task(db: Session, title: str, date, start_time=None, end_time=None, priority=1, completed=False):
+def create_task(db: Session, title: str, description: str, date, start_time=None, end_time=None, priority=1, completed=False):
     """
     Create a task in the DB. Mirrors /tasks endpoint.
     """
     task_data = {
         "title": title,
+        "description": description,
         "date": date,
         "start_time": start_time,
         "end_time": end_time,

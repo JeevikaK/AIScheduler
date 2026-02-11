@@ -1,15 +1,20 @@
 import json
-from typing import Optional, Dict
+from typing import List, Optional, Dict, Union
 from agents.prompt import SCHEDULER_SYSTEM_PROMPT
 from pydantic import BaseModel, Field
 from services.google_adk import GoogleADKClient
 
+class TaskArguments(BaseModel):
+    title: str
+    description: Optional[str]
+    date: str
+    explicit_time: Optional[str]
+    duration_minutes: int
+    priority: int
+
 class AgentDecision(BaseModel):
-    action: str = Field(
-        ...,
-        description="One of: create_task, reflect_task, get_schedule, replan_day, ask_user, respond"
-    )
-    arguments: Optional[Dict] = None
+    action: str
+    arguments: Optional[Union[Dict, List[Dict]]] = None
     question: Optional[str] = None
     message: Optional[str] = None
 
@@ -26,7 +31,6 @@ class SchedulerAgent:
             system_prompt=SCHEDULER_SYSTEM_PROMPT,
             user_prompt=user_text,
         )
-
         try:
             parsed = json.loads(raw)
             return AgentDecision(**parsed)

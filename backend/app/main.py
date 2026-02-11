@@ -1,13 +1,12 @@
-from http.client import HTTPException
 from app.models import Mood, Task
 from agents.scheduler_agent import scheduler_agent
 from agents.scheduler_executor import execute_decision
 from services.planner import get_historical_avg_duration, infer_task_type
 from services.scheduling import extract_date_from_text, find_available_slot, infer_duration_minutes
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.schemas import ChatInput, DailyScheduleResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
@@ -63,41 +62,91 @@ def create_reflection_endpoint(
         db=db,
     )
 
-@app.post("/chat", response_model=TaskResponse)
+@app.post("/chat", response_model=List[TaskResponse])
 def chat_create_task_endpoint(
     input: ChatInput,
     db: Session = Depends(get_db)
 ):
-    # Ask the agent
     decision = scheduler_agent.decide(input.message)
-    
-    if decision.action == "create_task":
-        args = decision.arguments or {}
 
+    if decision.action != "create_task":
+        raise HTTPException(status_code=400, detail=decision.message or "Unsupported action")
+
+    tasks_out = []
+    args_list = decision.arguments
+
+    if isinstance(args_list, dict):
+        args_list = [args_list]
+
+    for args in args_list or []:
+        # 1. Date
         task_date_str = args.get("date")
         task_date = datetime.strptime(task_date_str, "%Y-%m-%d").date()
 
-        start_time_str = args.get("start_time")  # e.g., "18:00"
-        start_time = datetime.strptime(start_time_str, "%H:%M").time() if start_time_str else None
-        end_time_str = args.get("end_time")  # e.g., "19:00"
-        end_time = datetime.strptime(end_time_str, "%H:%M").time() if end_time_str else None
+        # 2. Start & end times
+        start_time_str = args.get("start_time")
+        end_time_str = args.get("end_time")
 
+        if start_time_str and end_time_str:
+            start_time = datetime.strptime(start_time_str, "%H:%M").time()
+            end_time = datetime.strptime(end_time_str, "%H:%M").time()
+        else:
+            text = args.get("title", input.message)
+            mood = db.query(Mood).filter(Mood.date == task_date).first()
+            energy = mood.energy if mood else 3
+
+            task_type = infer_task_type(text)
+            historical_avg = get_historical_avg_duration(db, task_type, energy)
+            duration_min = infer_duration_minutes(
+                text=text,
+                task_type=task_type,
+                historical_avg=historical_avg,
+            )
+
+            if start_time and not end_time:
+                # compute end time from duration
+                duration_min = 60  # or infer based on task type
+                end_time = (
+                    datetime.combine(task_date, start_time) +
+                    timedelta(minutes=duration_min)
+                ).time()
+
+            if not start_time:
+                # Let scheduler find optimal slot
+                duration_min = 60  # or infer properly
+
+                start_time, end_time = find_available_slot(
+                    task_date=task_date,
+                    energy=3,  # or fetch mood energy
+                    db=db,
+                    duration_min=duration_min,
+                    deadline=None,
+                    priority=args.get("priority", 1),
+                )
+
+            # fallback if only start_time returned
+            if start_time == end_time:
+                end_time = (datetime.combine(task_date, start_time) + timedelta(minutes=duration_min)).time()
+
+            if not start_time:
+                # Could not find slot, skip task or set full-day
+                start_time = time(0, 0)
+                end_time = time(23, 59)
+
+        # 3. Create the task
         task = create_task(
             db=db,
             title=args.get("title", input.message),
+            description=args.get("description"),
             date=task_date,
             start_time=start_time,
             end_time=end_time,
             priority=args.get("priority", 1)
         )
-        return task
-    
-    elif decision.action == "respond":
-        # LLM fallback response
-        raise HTTPException(status_code=400, detail=decision.message)
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported action {decision.action}")
+        tasks_out.append(task)
 
+    return tasks_out
+    
 @app.get("/tasks", response_model=List[TaskResponse])
 def get_tasks_endpoint(task_date: date, db: Session = Depends(get_db)):
     return get_tasks(task_date, db)
