@@ -25,6 +25,7 @@ class Task(Base):
     actual_duration = Column(Integer, nullable=True)
     reflection_energy = Column(Integer, nullable=True)  # 1–5
     reflection_mood = Column(String, nullable=True)
+    duration_minutes = Column(Integer)
 
 class Mood(Base):
     __tablename__ = "moods"

@@ -17,13 +17,14 @@ class TaskCreate(BaseModel):
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     priority: int = 1
+    description: str
     
 class TaskResponse(TaskBase):
     id: int
     completed: bool
-
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class TaskReflectionInput(BaseModel):
     completed: bool
@@ -39,9 +40,9 @@ class MoodCreate(BaseModel):
 
 class MoodResponse(MoodCreate):
     id: int
-
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class ReflectionCreate(BaseModel):
     date: date
@@ -49,9 +50,9 @@ class ReflectionCreate(BaseModel):
 
 class ReflectionResponse(ReflectionCreate):
     id: int
-
-    class Config:
-        orm_mode = True
+    model_config = {
+        "from_attributes": True
+    }
 
 class ChatInput(BaseModel):
     message: str

@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 from app.db import get_db
 from services.planner import get_historical_avg_duration, get_overdue_tasks, infer_task_type, reschedule_task, update_duration_model
-from services.scheduling import extract_date_from_text, find_available_slot, infer_duration_minutes
+from services.scheduling import extract_date_from_text, infer_duration_minutes
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from app.models import Reflection, Task, Mood
@@ -22,7 +22,7 @@ def infer_priority(text: str):
 
     return 3
 
-def create_task(db: Session, title: str, description: str, date, start_time=None, end_time=None, priority=1, completed=False):
+def create_task(db: Session, title: str, description: str, date, start_time=None, end_time=None, priority=1, completed=False, duration_minutes=None):
     """
     Create a task in the DB. Mirrors /tasks endpoint.
     """
@@ -34,6 +34,7 @@ def create_task(db: Session, title: str, description: str, date, start_time=None
         "end_time": end_time,
         "priority": priority,
         "completed": completed,
+        "duration_minutes": duration_minutes,
     }
     db_task = Task(**task_data)
     db.add(db_task)
@@ -67,71 +68,6 @@ def create_reflection(
     db.refresh(db_reflection)
     return db_reflection
 
-def chat_create_task(
-    input: ChatInput,
-    db: Session = Depends(get_db)
-):
-    text = input.message
-
-    # 1. Extract execution date from NL
-    task_date = extract_date_from_text(text)
-
-    # 2. Fetch mood & energy
-    mood = db.query(Mood).filter(Mood.date == task_date).first()
-    energy = mood.energy if mood else 3
-
-    # 3. Duration inference
-    task_type = infer_task_type(text)
-    historical_avg = get_historical_avg_duration(db, task_type, energy)
-    duration_min = infer_duration_minutes(
-        text=text,
-        task_type=task_type,
-        historical_avg=historical_avg,
-    )
-
-    # 4. Priority & deadline
-    priority = infer_priority(text)
-    deadline = extract_date_from_text(text)
-
-    # 5. Scheduling (find best available slot)
-    start_time, end_time = find_available_slot(
-        task_date=task_date,
-        energy=energy,
-        db=db,
-        duration_min=duration_min,
-        deadline=deadline,
-        priority=priority,
-    )
-
-    # fallback: if slot only returned start_time
-    if start_time == end_time:
-        end_time = (
-            datetime.combine(task_date, start_time)
-            + timedelta(minutes=duration_min)
-        ).time()
-
-    if not start_time:
-        raise HTTPException(
-            status_code=409,
-            detail="No available time slot for this day"
-        )
-
-    # 6. Create task in DB
-    task = Task(
-        title=text.capitalize(),
-        date=task_date,
-        start_time=start_time,
-        end_time=end_time,
-        completed=False,
-        priority=priority,
-        deadline=deadline
-    )
-
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-
-    return task
 
 def get_tasks(task_date: date, db: Session = Depends(get_db)):
     return db.query(Task).filter(Task.date == task_date).all()

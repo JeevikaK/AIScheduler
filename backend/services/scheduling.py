@@ -1,5 +1,6 @@
 from datetime import date, datetime, time, timedelta
 import re
+from typing import List, Tuple
 from dateparser.search import search_dates
 from requests import Session
 from app.models import DurationStats, Task
@@ -7,34 +8,111 @@ from app.models import DurationStats, Task
 WORK_START = time(9, 0)  # 9:00 AM
 WORK_END = time(21, 0)   # 9:00 PM
 DEFAULT_DURATION_MINUTES = 60  # default task duration
+TASK_BUFFER_MIN = 5
 
-def find_time_slot(task_date: date, db: Session, duration_minutes: int = DEFAULT_DURATION_MINUTES):
+DEFAULT_DURATION_BY_TYPE = {
+    "fitness": 60,
+    "assessment": 120,
+    "study": 90,
+    "meeting": 30,
+    "general": 60,
+}
+
+
+def optimize_day_schedule(
+    db: Session,
+    task_date: date,
+    new_task_data: dict,
+    duration_min: int,
+) -> Tuple[time, time]:
     """
-    Find the first available time slot for the task on task_date.
-    Simple greedy algorithm: fills earliest free slot.
+    Schedule a new task intelligently within the day, using existing tasks,
+    energy levels, priorities, and fixed events.
+    
+    Returns start_time and end_time for the new task.
     """
-    existing_tasks = db.query(Task).filter(Task.date == task_date).all()
-    existing_tasks = sorted(existing_tasks, key=lambda t: t.start_time or WORK_START)
+    from app.models import Task, Mood
 
-    # Start searching from WORK_START
-    current_start = datetime.combine(task_date, WORK_START)
-    work_end_dt = datetime.combine(task_date, WORK_END)
-    duration_td = timedelta(minutes=duration_minutes)
+    # Fetch all existing tasks for the day
+    existing_tasks: List[Task] = db.query(Task).filter(Task.date == task_date).all()
+    
+    # Fetch mood/energy for the day
+    mood = db.query(Mood).filter(Mood.date == task_date).first()
+    energy_level = mood.energy if mood else 3
 
-    for task in existing_tasks:
-        task_start = datetime.combine(task_date, task.start_time or WORK_START)
-        task_end = datetime.combine(task_date, task.end_time) if task.end_time else task_start + duration_td
-        if current_start + duration_td <= task_start:
-            # Found a gap
-            return current_start.time(), (current_start + duration_td).time()
-        current_start = max(current_start, task_end)
-        
-        # If no gaps, place at the end of workday
-    if current_start + duration_td <= work_end_dt:
-        return current_start.time(), (current_start + duration_td).time()
+    # Create the new task object
+    new_task = Task(
+        title=new_task_data.get("title"),
+        description=new_task_data.get("description"),
+        priority=new_task_data.get("priority", 1),
+        start_time=None,
+        end_time=None,
+    )
 
-    # If fully booked, just return WORK_START slot (overlap)
-    return WORK_START, (datetime.combine(task_date, WORK_START) + duration_td).time()
+    all_tasks = existing_tasks + [new_task]
+    
+    # Convert all tasks to dict with actual duration
+    task_list = []
+    for t in all_tasks:
+        if t.start_time and t.end_time:
+            start_dt = datetime.combine(task_date, t.start_time)
+            end_dt = datetime.combine(task_date, t.end_time)
+            duration = int((end_dt - start_dt).total_seconds() / 60)
+        else:
+            # fallback: use duration_min or 60 for existing tasks
+            duration = getattr(t, "duration_min", 60)
+        task_list.append({
+            "task": t,
+            "duration": duration,
+            "fixed": bool(t.start_time),  # cannot move if fixed
+            "priority": getattr(t, "priority", 1)
+        })
+
+    # Sort by priority (desc) and fixed time first
+    task_list.sort(key=lambda x: (x["fixed"], -x["priority"]))
+    
+    # Assign slots sequentially
+    current_dt = datetime.combine(task_date, WORK_START)
+    for item in task_list:
+        task = item["task"]
+        duration = item["duration"]
+
+        if item["fixed"]:
+            # Already has start/end, move current_dt forward if needed
+            task_start = datetime.combine(task_date, task.start_time)
+            task_end = datetime.combine(task_date, task.end_time)
+            if current_dt > task_start:
+                # overlap: shift start after current_dt
+                task_start = current_dt
+                task_end = task_start + timedelta(minutes=duration)
+        else:
+            # Schedule based on energy: prefer high-energy first half day
+            if energy_level >= 4:
+                # high energy: schedule in morning if possible
+                task_start = current_dt
+            elif energy_level <= 2:
+                # low energy: schedule in later slot
+                if current_dt.time() < time(12, 0):
+                    task_start = datetime.combine(task_date, time(12, 0))
+                else:
+                    task_start = current_dt
+            else:
+                task_start = current_dt
+
+            task_end = task_start + timedelta(minutes=duration)
+            # Ensure task_end does not exceed workday
+            if task_end.time() > WORK_END:
+                task_end = datetime.combine(task_date, WORK_END)
+
+        # Assign times
+        task.start_time = task_start.time()
+        task.end_time = task_end.time()
+
+        # Move current_dt forward
+        current_dt = task_end + timedelta(minutes=TASK_BUFFER_MIN)
+
+    # Return new task times
+    return new_task.start_time, new_task.end_time
 
 def extract_date_from_text(text: str):
     result = search_dates(
@@ -56,36 +134,36 @@ def extract_date_from_text(text: str):
 
 from datetime import datetime, timedelta, time
 
-def find_available_slot(task_date, energy, db, duration_min=60, deadline=None, priority=None):
-    existing_tasks = db.query(Task).filter(Task.date == task_date).all()
+# def find_available_slot(task_date, energy, db, duration_min=60, deadline=None, priority=None):
+#     existing_tasks = db.query(Task).filter(Task.date == task_date).all()
 
-    # Determine ideal starting point based on energy/deadline
-    if deadline and (deadline - task_date).days <= 1:
-        search_start = WORK_START  # Urgent: check entire day from start
-    elif energy <= 2:
-        search_start = time(16, 0) # Low energy: late start
-    elif energy == 3:
-        search_start = time(14, 0) # Medium energy: mid-day
-    else:
-        search_start = time(9, 0)  # High energy: morning
+#     # Determine ideal starting point based on energy/deadline
+#     if deadline and (deadline - task_date).days <= 1:
+#         search_start = WORK_START  # Urgent: check entire day from start
+#     elif energy <= 2:
+#         search_start = time(16, 0) # Low energy: late start
+#     elif energy == 3:
+#         search_start = time(14, 0) # Medium energy: mid-day
+#     else:
+#         search_start = time(9, 0)  # High energy: morning
 
-    current_time = datetime.combine(task_date, search_start)
-    end_of_day = datetime.combine(task_date, WORK_END)
+#     current_time = datetime.combine(task_date, search_start)
+#     end_of_day = datetime.combine(task_date, WORK_END)
 
-    while current_time + timedelta(minutes=duration_min) <= end_of_day:
-        slot_start = current_time.time()
-        slot_end = (current_time + timedelta(minutes=duration_min)).time()
+#     while current_time + timedelta(minutes=duration_min) <= end_of_day:
+#         slot_start = current_time.time()
+#         slot_end = (current_time + timedelta(minutes=duration_min)).time()
 
-        if not has_conflict(slot_start, slot_end, existing_tasks):
-            return slot_start, slot_end
+#         if not has_conflict(slot_start, slot_end, existing_tasks):
+#             return slot_start, slot_end
 
-        # Move forward in 30-minute increments
-        current_time += timedelta(minutes=30)
+#         # Move forward in 30-minute increments
+#         current_time += timedelta(minutes=30)
         
-        # Safety: If we hit WORK_END and found nothing, 
-        # consider a "fallback" to search the morning if we haven't already.
+#         # Safety: If we hit WORK_END and found nothing, 
+#         # consider a "fallback" to search the morning if we haven't already.
     
-    return None, None
+#     return None, None
 
 def has_conflict(start, end, existing_tasks):
     for task in existing_tasks:
@@ -100,7 +178,8 @@ def infer_duration_minutes(
     text: str,
     task_type: str | None = None,
     energy_level: int | None = None,   # 1–5
-    historical_avg: int | None = None  # minutes from reflection loop
+    historical_avg: int | None = None,  # minutes from reflection loop
+    deadline_date: date | None = None
 ):
     text = text.lower()
 
@@ -159,13 +238,71 @@ def infer_duration_minutes(
         base += 30
 
     # -----------------------------
+    # 4.5 Deadline proximity scaling
+    # -----------------------------
+    if deadline_date:
+        today = date.today()
+        days_remaining = (deadline_date - today).days
+
+        if days_remaining < 0:
+            # overdue → high urgency
+            base *= 1.5
+
+        elif days_remaining == 0:
+            # due today
+            base *= 1.4
+
+        elif days_remaining == 1:
+            base *= 1.3
+
+        elif days_remaining <= 3:
+            base *= 1.2
+
+        elif days_remaining <= 7:
+            base *= 1.1
+
+    # -----------------------------
     # 5. Energy-based adjustment
     # -----------------------------
-    if energy_level:
+    if energy_level is not None:
+        cognitive_tasks = [
+            "study", "revision", "assignment", "project",
+            "coding", "reading", "presentation"
+        ]
+
+        physical_tasks = [
+            "exercise", "gym", "workout"
+        ]
+
+        admin_tasks = [
+            "meeting", "errand"
+        ]
+
+        is_cognitive = any(word in text for word in cognitive_tasks)
+        is_physical = any(word in text for word in physical_tasks)
+        is_admin = any(word in text for word in admin_tasks)
+
+        # Low energy
         if energy_level <= 2:
-            base *= 1.25   # low energy → slower
+            if is_cognitive:
+                base *= 1.35   # brain slower
+            elif is_physical:
+                base *= 1.15   # still harder physically
+            else:
+                base *= 1.20
+
+        # Medium-high energy
+        elif energy_level == 3:
+            pass  # no change
+
+        # High energy
         elif energy_level >= 4:
-            base *= 0.85   # high energy → faster
+            if is_cognitive:
+                base *= 0.80   # deep focus compresses
+            elif is_physical:
+                base *= 0.90
+            else:
+                base *= 0.95
 
     # -----------------------------
     # 6. Reflection-based override (MOST IMPORTANT long-term)
@@ -173,7 +310,7 @@ def infer_duration_minutes(
     if historical_avg:
         # Weighted blend: learned behavior > heuristics
         base = int(0.7 * historical_avg + 0.3 * base)
-
+    
     # -----------------------------
     # 7. Safety bounds
     # -----------------------------
@@ -212,3 +349,10 @@ def store_duration_delta(
         stat.count += 1
 
     db.commit()
+
+def parse_time(time_str: str) -> time:
+    """Parse a time string that may or may not have seconds."""
+    try:
+        return datetime.strptime(time_str, "%H:%M:%S").time()
+    except ValueError:
+        return datetime.strptime(time_str, "%H:%M").time()

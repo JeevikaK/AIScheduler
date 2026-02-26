@@ -2,7 +2,7 @@ import json
 from typing import List, Optional, Dict, Union
 from agents.prompt import SCHEDULER_SYSTEM_PROMPT
 from pydantic import BaseModel, Field
-from services.google_adk import GoogleADKClient
+from services.google_adk import OpenAIClient
 
 class TaskArguments(BaseModel):
     title: str
@@ -41,5 +41,5 @@ class SchedulerAgent:
                 message="Sorry, I didn’t understand that. Can you rephrase?"
             )
 
-llm_client = GoogleADKClient()
+llm_client = OpenAIClient()
 scheduler_agent = SchedulerAgent(llm_client)
