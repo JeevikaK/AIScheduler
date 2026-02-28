@@ -1,13 +1,14 @@
 from datetime import date, datetime, time, timedelta
-from typing import List
+from typing import Any, Callable, List
 import re
 
 from sqlalchemy.orm import Session
 
-from app.models import Task
-from services.planner import infer_task_type, rebalance_day
-from services.scheduling import extract_date_from_text
-from services.tools import infer_priority
+from app.models import Mood, Task
+from app.schemas import ChatMeta, ChatResponse
+from services.planner import get_historical_avg_duration, infer_task_type, rebalance_day
+from services.scheduling import extract_date_from_text, infer_duration_minutes, parse_time
+from services.tools import create_task, get_schedule, infer_priority
 
 STOP_WORDS = {
     "the", "a", "an", "to", "for", "and", "or", "is", "at", "on", "in", "of", "my",
@@ -472,3 +473,293 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
             changed.append(task)
 
     return changed
+
+
+def _build_response(
+    mode: str,
+    message: str,
+    created_tasks=None,
+    updated_tasks=None,
+    unchanged_tasks=None,
+    used_fallback_parser: bool = False,
+    used_replan_handler: bool = False,
+    affected_dates=None,
+    warnings=None,
+) -> ChatResponse:
+    created_tasks = created_tasks or []
+    updated_tasks = updated_tasks or []
+    unchanged_tasks = unchanged_tasks or []
+    affected_dates = sorted(list(affected_dates or []))
+    warnings = warnings or []
+
+    created_ids = {t.id for t in created_tasks}
+    updated_ids = {t.id for t in updated_tasks}
+    unscheduled = []
+    unscheduled_ids = set()
+    for task in created_tasks + updated_tasks + unchanged_tasks:
+        if task.id in unscheduled_ids:
+            continue
+        if (not task.start_time) or (not task.end_time):
+            unscheduled.append(task)
+            unscheduled_ids.add(task.id)
+
+    unchanged_filtered = [t for t in unchanged_tasks if t.id not in created_ids and t.id not in updated_ids]
+
+    return ChatResponse(
+        mode=mode,
+        message=message,
+        created_tasks=created_tasks,
+        updated_tasks=updated_tasks,
+        unchanged_tasks=unchanged_filtered,
+        unscheduled_tasks=unscheduled,
+        meta=ChatMeta(
+            used_fallback_parser=used_fallback_parser,
+            used_replan_handler=used_replan_handler,
+            affected_dates=affected_dates,
+            warnings=warnings,
+        ),
+    )
+
+
+def _collect_updated_tasks_for_dates(db: Session, before_state_by_date, dates):
+    updated = []
+    seen = set()
+    for d in dates:
+        before_state = before_state_by_date.get(d, {})
+        refreshed = (
+            db.query(Task)
+            .filter(Task.date == d, Task.completed == False)
+            .order_by(Task.start_time.asc(), Task.priority.desc(), Task.id.asc())
+            .all()
+        )
+        for task in refreshed:
+            if task.id not in before_state:
+                continue
+            before = before_state[task.id]
+            after = (task.date, task.start_time, task.end_time)
+            if before != after and task.id not in seen:
+                updated.append(task)
+                seen.add(task.id)
+    return updated
+
+
+def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], Any]) -> ChatResponse:
+    today = date.today()
+    context = build_schedule_context(db, today=today)
+    model_input = (
+        "Existing schedule context (use this for follow-up commands):\n"
+        f"{context}\n\n"
+        f"User message:\n{message}"
+    )
+    decision = decide_fn(model_input)
+    fallback_multi = split_tasks_from_message(message)
+    used_fallback_parser = False
+
+    if decision.action != "create_task":
+        replanned = handle_followup_replan(message, db)
+        if replanned:
+            return _build_response(
+                mode="replan",
+                message="Updated existing tasks based on your follow-up request.",
+                updated_tasks=replanned,
+                used_replan_handler=True,
+                affected_dates={t.date for t in replanned},
+            )
+        if decision.action == "get_schedule":
+            tasks = get_schedule(today, db)
+            return _build_response(
+                mode="schedule",
+                message="Here is your schedule.",
+                unchanged_tasks=tasks,
+                affected_dates={today},
+            )
+        # If model action drifts but input clearly contains task items, continue with local extraction.
+        if not fallback_multi:
+            return _build_response(
+                mode="replan",
+                message="No matching task updates were applied.",
+                used_replan_handler=True,
+                warnings=["No matching tasks found for this follow-up request."],
+            )
+        args_list = fallback_multi
+        used_fallback_parser = True
+    else:
+        args_list = decision.arguments
+
+    created_tasks = []
+
+    if isinstance(args_list, dict):
+        args_list = [args_list]
+
+    if not args_list:
+        args_list = fallback_multi
+        used_fallback_parser = True
+    elif len(args_list) == 1:
+        only = args_list[0] or {}
+        only_title = (only.get("title") or "").strip().lower()
+        input_clean = message.strip().lower()
+        if len(fallback_multi) > 1 and (not only_title or only_title == input_clean):
+            args_list = fallback_multi
+            used_fallback_parser = True
+
+    # Track which dates need rebalancing and tasks that should stay fixed
+    affected_dates = set()
+    pinned_task_ids_by_date = {}
+    before_state_by_date = {}
+
+    def ensure_before_state(target_date):
+        if target_date in before_state_by_date:
+            return
+        tasks = db.query(Task).filter(Task.date == target_date, Task.completed == False).all()
+        before_state_by_date[target_date] = {
+            t.id: (t.date, t.start_time, t.end_time)
+            for t in tasks
+        }
+
+    for args in args_list or []:
+        raw_text = args.get("title") or args.get("description") or message
+        text = title_from_text(raw_text)
+        description = description_from_text(args.get("description") or raw_text)
+        priority = args.get("priority", 1)
+
+        task_date_str = args.get("date")
+        start_time_str = args.get("start_time")
+        end_time_str = args.get("end_time")
+
+        task_type = args.get("task_type", "other")
+        spread = args.get("spread", False)
+        total_effort = args.get("total_effort_minutes")
+        deadline_str = args.get("deadline")
+
+        task_date = None
+        if task_date_str:
+            task_date = datetime.strptime(task_date_str, "%Y-%m-%d").date()
+
+        deadline_date = None
+        if deadline_str:
+            deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+
+        today = date.today()
+
+        # Parse explicit times when provided
+        start_time_val = None
+        end_time_val = None
+        if isinstance(start_time_str, str) and start_time_str.strip():
+            start_time_val = parse_time(start_time_str.strip())
+        if isinstance(end_time_str, str) and end_time_str.strip():
+            end_time_val = parse_time(end_time_str.strip())
+
+        # Fallback: if model omitted explicit start_time, infer from text.
+        if not start_time_val:
+            start_time_val = extract_time_from_text(
+                f"{args.get('title') or ''} {args.get('description') or ''} {message}"
+            )
+
+        effective_date = task_date or today
+
+        # Duration fallback
+        if not total_effort:
+            mood = db.query(Mood).filter(Mood.date == effective_date).first()
+            energy = mood.energy if mood else 3
+            historical_avg = get_historical_avg_duration(db, task_type, energy)
+            total_effort = infer_duration_minutes(
+                text=text,
+                task_type=task_type,
+                energy_level=energy,
+                historical_avg=historical_avg,
+                deadline_date=deadline_date,
+            )
+
+        if start_time_val and not end_time_val and total_effort:
+            end_time_val = (
+                datetime.combine(effective_date, start_time_val) +
+                timedelta(minutes=total_effort)
+            ).time()
+
+        # Spread logic
+        if spread and deadline_date:
+            if deadline_date <= today:
+                session_date = today
+                duration_min = total_effort
+                ensure_before_state(session_date)
+                task = create_task(
+                    db=db,
+                    title=f"{text} (Urgent)",
+                    description=description,
+                    date=session_date,
+                    start_time=start_time_val,
+                    end_time=end_time_val,
+                    priority=priority + 1,
+                    duration_minutes=duration_min,
+                )
+                affected_dates.add(session_date)
+                if start_time_val:
+                    pinned_task_ids_by_date.setdefault(session_date, set()).add(task.id)
+                created_tasks.append(task)
+                continue
+
+            days_available = (deadline_date - today).days
+            days_to_plan = min(max(days_available, 1), 7)
+            base_session = max(45, total_effort // days_to_plan)
+            remaining = total_effort
+
+            for i in range(days_to_plan):
+                if remaining <= 0:
+                    break
+                session_date = today + timedelta(days=i)
+                duration_min = min(base_session, remaining)
+                remaining -= duration_min
+                ensure_before_state(session_date)
+                task = create_task(
+                    db=db,
+                    title=f"{text} (Session {i+1})",
+                    description=description,
+                    date=session_date,
+                    start_time=None,
+                    end_time=None,
+                    priority=priority,
+                    duration_minutes=duration_min,
+                )
+                affected_dates.add(session_date)
+                created_tasks.append(task)
+            continue
+
+        # Single-day task
+        if not task_date:
+            task_date = today
+        duration_min = total_effort
+        ensure_before_state(task_date)
+        task = create_task(
+            db=db,
+            title=text,
+            description=description,
+            date=task_date,
+            start_time=start_time_val,
+            end_time=end_time_val,
+            priority=priority,
+            duration_minutes=duration_min,
+        )
+        affected_dates.add(task_date)
+        if start_time_val:
+            pinned_task_ids_by_date.setdefault(task_date, set()).add(task.id)
+        created_tasks.append(task)
+
+    for d in affected_dates:
+        rebalance_day(
+            db,
+            d,
+            pinned_task_ids=pinned_task_ids_by_date.get(d, set()),
+        )
+
+    updated_tasks = _collect_updated_tasks_for_dates(db, before_state_by_date, affected_dates)
+    created_ids = {t.id for t in created_tasks}
+    updated_tasks = [t for t in updated_tasks if t.id not in created_ids]
+
+    return _build_response(
+        mode="create",
+        message="Created and scheduled tasks.",
+        created_tasks=created_tasks,
+        updated_tasks=updated_tasks,
+        used_fallback_parser=used_fallback_parser,
+        affected_dates=affected_dates,
+    )
