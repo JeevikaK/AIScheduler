@@ -1,5 +1,5 @@
 # app/services/tools.py
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, time
 from typing import Optional
 from app.db import get_db
 from services.planner import get_historical_avg_duration, get_overdue_tasks, infer_task_type, reschedule_task, update_duration_model

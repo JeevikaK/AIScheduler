@@ -115,6 +115,17 @@ def optimize_day_schedule(
     return new_task.start_time, new_task.end_time
 
 def extract_date_from_text(text: str):
+    lower = (text or "").lower()
+    today = date.today()
+
+    # Deterministic handling for common relative cues.
+    if "day after tomorrow" in lower:
+        return today + timedelta(days=2)
+    if "tomorrow" in lower:
+        return today + timedelta(days=1)
+    if "today" in lower or "tonight" in lower:
+        return today
+
     result = search_dates(
         text,
         settings={
@@ -126,44 +137,20 @@ def extract_date_from_text(text: str):
     )
 
     if result:
-        _, parsed_date = result[0]
+        # Prefer parsed entries that look like calendar dates over bare hour-only fragments.
+        parsed_date = None
+        for matched, parsed in result:
+            token = (matched or "").strip().lower()
+            if re.fullmatch(r"\d{1,2}", token):
+                continue
+            parsed_date = parsed
+            break
+        if parsed_date is None:
+            _, parsed_date = result[0]
         return parsed_date.date()
 
-    return date.today()
+    return today
 
-
-from datetime import datetime, timedelta, time
-
-# def find_available_slot(task_date, energy, db, duration_min=60, deadline=None, priority=None):
-#     existing_tasks = db.query(Task).filter(Task.date == task_date).all()
-
-#     # Determine ideal starting point based on energy/deadline
-#     if deadline and (deadline - task_date).days <= 1:
-#         search_start = WORK_START  # Urgent: check entire day from start
-#     elif energy <= 2:
-#         search_start = time(16, 0) # Low energy: late start
-#     elif energy == 3:
-#         search_start = time(14, 0) # Medium energy: mid-day
-#     else:
-#         search_start = time(9, 0)  # High energy: morning
-
-#     current_time = datetime.combine(task_date, search_start)
-#     end_of_day = datetime.combine(task_date, WORK_END)
-
-#     while current_time + timedelta(minutes=duration_min) <= end_of_day:
-#         slot_start = current_time.time()
-#         slot_end = (current_time + timedelta(minutes=duration_min)).time()
-
-#         if not has_conflict(slot_start, slot_end, existing_tasks):
-#             return slot_start, slot_end
-
-#         # Move forward in 30-minute increments
-#         current_time += timedelta(minutes=30)
-        
-#         # Safety: If we hit WORK_END and found nothing, 
-#         # consider a "fallback" to search the morning if we haven't already.
-    
-#     return None, None
 
 def has_conflict(start, end, existing_tasks):
     for task in existing_tasks:
@@ -182,15 +169,35 @@ def infer_duration_minutes(
     deadline_date: date | None = None
 ):
     text = text.lower()
+    word_to_num = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+    }
 
     # -----------------------------
     # 1. Explicit durations (highest priority)
     # -----------------------------
-    hours = re.findall(r"(\d+(?:\.\d+)?)\s*hour", text)
-    minutes = re.findall(r"(\d+)\s*min", text)
+    hours = re.findall(r"(\d+(?:\.\d+)?)\s*(?:hour|hours|hr|hrs)\b", text)
+    minutes = re.findall(r"(\d+)\s*(?:min|mins|minute|minutes)\b", text)
+    word_hours = re.findall(
+        r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:hour|hours|hr|hrs)\b",
+        text,
+    )
 
     if hours:
         return int(float(hours[0]) * 60)
+    if word_hours:
+        return int(word_to_num[word_hours[0]] * 60)
 
     if minutes:
         return int(minutes[0])

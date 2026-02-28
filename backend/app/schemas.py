@@ -1,6 +1,6 @@
 from datetime import time, date
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.db import Base, engine
 
 class TaskBase(BaseModel):
@@ -56,6 +56,21 @@ class ReflectionResponse(ReflectionCreate):
 
 class ChatInput(BaseModel):
     message: str
+
+class ChatMeta(BaseModel):
+    used_fallback_parser: bool = False
+    used_replan_handler: bool = False
+    affected_dates: List[date] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+class ChatResponse(BaseModel):
+    mode: str
+    message: str
+    created_tasks: List[TaskResponse] = Field(default_factory=list)
+    updated_tasks: List[TaskResponse] = Field(default_factory=list)
+    unchanged_tasks: List[TaskResponse] = Field(default_factory=list)
+    unscheduled_tasks: List[TaskResponse] = Field(default_factory=list)
+    meta: ChatMeta
 
 class DailyScheduleResponse(BaseModel):
     date: date

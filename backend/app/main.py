@@ -1,17 +1,23 @@
 from app.models import Mood, Task
 from agents.scheduler_agent import scheduler_agent
-from agents.scheduler_executor import execute_decision
-from services.planner import get_historical_avg_duration, infer_task_type, rebalance_day
-from services.scheduling import extract_date_from_text, infer_duration_minutes, optimize_day_schedule, parse_time
-from fastapi import FastAPI, Depends, Query, HTTPException
+from services.planner import get_historical_avg_duration, rebalance_day
+from services.scheduling import infer_duration_minutes, parse_time
+from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
-from datetime import date, datetime, time, timedelta
-import re
+from datetime import date, datetime, timedelta
 from sqlalchemy.orm import Session
 from app.db import get_db
-from app.schemas import ChatInput, DailyScheduleResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
-from services.tools import create_mood, create_reflection, create_task, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, infer_priority, reflect_on_task, delete_task, reschedule_overdue_tasks, get_summary
+from app.schemas import ChatInput, ChatMeta, ChatResponse, DailyScheduleResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
+from services.tools import create_mood, create_reflection, create_task, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, reflect_on_task, delete_task, reschedule_overdue_tasks, get_summary
+from services.chat_helpers import (
+    build_schedule_context,
+    description_from_text,
+    extract_time_from_text,
+    handle_followup_replan,
+    split_tasks_from_message,
+    title_from_text,
+)
 
 app = FastAPI(title="AI Life Planner")
 
@@ -25,275 +31,6 @@ app.add_middleware(
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
-
-def _title_from_text(text: str) -> str:
-    clean = re.sub(r"\s+", " ", (text or "").strip(" .,\n\t"))
-    if not clean:
-        return "Untitled task"
-    words = clean.split(" ")
-    short = " ".join(words[:8])
-    return short[:1].upper() + short[1:]
-
-def _description_from_text(text: str) -> str:
-    clean = re.sub(r"\s+", " ", (text or "").strip())
-    if not clean:
-        return "Task generated from user request."
-    return clean if clean.endswith((".", "!", "?")) else f"{clean}."
-
-def _split_tasks_from_message(message: str):
-    if not message or not message.strip():
-        return []
-
-    parts = re.split(
-        r"(?:\n|;|,|\band then\b|\bthen\b|\bplus\b|\balso\b|\s+and\s+)",
-        message,
-        flags=re.IGNORECASE,
-    )
-    candidates = [p.strip(" .\t") for p in parts if p and p.strip(" .\t")]
-
-    if len(candidates) < 2:
-        return []
-
-    tasks = []
-    for segment in candidates:
-        task_date = extract_date_from_text(segment)
-        tasks.append(
-            {
-                "title": _title_from_text(segment),
-                "description": _description_from_text(segment),
-                "date": task_date.isoformat(),
-                "start_time": None,
-                "end_time": None,
-                "priority": infer_priority(segment),
-                "task_type": infer_task_type(segment),
-                "total_effort_minutes": None,
-                "deadline": None,
-                "spread": False,
-            }
-        )
-    return tasks
-
-def _extract_time_from_text(text: str):
-    if not text:
-        return None
-
-    ampm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text, flags=re.IGNORECASE)
-    if ampm:
-        hour = int(ampm.group(1))
-        minute = int(ampm.group(2) or 0)
-        meridian = ampm.group(3).lower()
-        if meridian == "pm" and hour != 12:
-            hour += 12
-        if meridian == "am" and hour == 12:
-            hour = 0
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return time(hour, minute)
-
-    hhmm = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
-    if hhmm:
-        return time(int(hhmm.group(1)), int(hhmm.group(2)))
-
-    return None
-
-def _task_duration_minutes(task: Task) -> int:
-    if task.duration_minutes and task.duration_minutes > 0:
-        return int(task.duration_minutes)
-    if task.start_time and task.end_time:
-        return max(
-            15,
-            int(
-                (
-                    datetime.combine(task.date, task.end_time) -
-                    datetime.combine(task.date, task.start_time)
-                ).total_seconds() // 60
-            ),
-        )
-    return 60
-
-def _build_schedule_context(db: Session, today: date, days: int = 7) -> str:
-    end_date = today + timedelta(days=days)
-    tasks = (
-        db.query(Task)
-        .filter(Task.date >= today, Task.date <= end_date, Task.completed == False)
-        .order_by(Task.date.asc(), Task.start_time.asc(), Task.priority.desc())
-        .limit(30)
-        .all()
-    )
-    if not tasks:
-        return "No upcoming tasks."
-
-    lines = []
-    for t in tasks:
-        st = t.start_time.strftime("%H:%M") if t.start_time else "unscheduled"
-        et = t.end_time.strftime("%H:%M") if t.end_time else "unscheduled"
-        lines.append(f"- {t.date.isoformat()} | {st}-{et} | {t.title}")
-    return "\n".join(lines)
-
-def _handle_followup_replan(message: str, db: Session) -> List[Task]:
-    today = date.today()
-    text = (message or "").lower()
-    requested_time = _extract_time_from_text(message)
-
-    exam_keywords = ["exam", "quiz", "test", "assessment"]
-    revision_keywords = ["revision", "revise", "review", "study", "prep", "prepare"]
-    session_keywords = ["session", "chapter", "practice"]
-
-    upcoming = (
-        db.query(Task)
-        .filter(Task.date >= today, Task.completed == False)
-        .order_by(Task.date.asc(), Task.start_time.asc(), Task.priority.desc())
-        .all()
-    )
-
-    def _task_hay(task: Task) -> str:
-        return f"{(task.title or '').lower()} {(task.description or '').lower()}"
-
-    def _is_revision_task(task: Task) -> bool:
-        hay = _task_hay(task)
-        return any(k in hay for k in revision_keywords + session_keywords)
-
-    def _is_exam_event_task(task: Task) -> bool:
-        hay = _task_hay(task)
-        has_exam_word = any(k in hay for k in exam_keywords)
-        return has_exam_word and not _is_revision_task(task)
-
-    exam_candidates = [t for t in upcoming if _is_exam_event_task(t)]
-    exam_task = exam_candidates[0] if exam_candidates else None
-
-    if not exam_task:
-        # Fallback: no explicit exam task exists, infer target day from study/revision sessions.
-        if not requested_time:
-            return []
-
-        revision_pool = [t for t in upcoming if _is_revision_task(t)]
-
-        if not revision_pool:
-            return []
-
-        # Prefer the latest upcoming revision day (typically deadline/exam day).
-        target_date = max(t.date for t in revision_pool)
-        day_revisions = [
-            t for t in revision_pool
-            if t.date == target_date
-        ]
-        if not day_revisions:
-            return []
-
-        before_state = {
-            t.id: (t.date, t.start_time, t.end_time)
-            for t in db.query(Task).filter(Task.date == target_date, Task.completed == False).all()
-        }
-
-        rev = sorted(
-            day_revisions,
-            key=lambda t: (-t.priority, t.start_time or time(23, 59), t.id)
-        )[0]
-        rev_duration = _task_duration_minutes(rev)
-        buffer_min = 5
-        rev_end_dt = datetime.combine(target_date, requested_time) - timedelta(minutes=buffer_min)
-        rev_start_dt = rev_end_dt - timedelta(minutes=rev_duration)
-        day_start = datetime.combine(target_date, time(9, 0))
-        if rev_start_dt < day_start:
-            rev_start_dt = day_start
-            rev_end_dt = rev_start_dt + timedelta(minutes=rev_duration)
-
-        rev.start_time = rev_start_dt.time()
-        rev.end_time = rev_end_dt.time()
-        db.commit()
-        db.refresh(rev)
-
-        rebalance_day(db, target_date, pinned_task_ids={rev.id})
-
-        refreshed = (
-            db.query(Task)
-            .filter(Task.date == target_date, Task.completed == False)
-            .order_by(Task.start_time.asc(), Task.priority.desc())
-            .all()
-        )
-        changed = []
-        for task in refreshed:
-            after = (task.date, task.start_time, task.end_time)
-            before = before_state.get(task.id)
-            if before != after:
-                changed.append(task)
-        return changed
-
-    # Snapshot day state so we can return only changed tasks.
-    before_day_tasks = (
-        db.query(Task)
-        .filter(Task.date == exam_task.date, Task.completed == False)
-        .all()
-    )
-    before_state = {
-        t.id: (t.date, t.start_time, t.end_time)
-        for t in before_day_tasks
-    }
-
-    # If user specified exam time in follow-up, update exam slot.
-    if requested_time:
-        duration = _task_duration_minutes(exam_task)
-        exam_task.start_time = requested_time
-        exam_task.end_time = (
-            datetime.combine(exam_task.date, requested_time) +
-            timedelta(minutes=duration)
-        ).time()
-        db.commit()
-        db.refresh(exam_task)
-
-    pinned_ids = {exam_task.id}
-    wants_revision_adjust = any(k in text for k in revision_keywords)
-
-    if wants_revision_adjust:
-        # Candidate revision tasks on exam day.
-        same_day = (
-            db.query(Task)
-            .filter(
-                Task.date == exam_task.date,
-                Task.completed == False,
-                Task.id != exam_task.id,
-            )
-            .order_by(Task.priority.desc(), Task.start_time.asc(), Task.id.asc())
-            .all()
-        )
-
-        revisions = [t for t in same_day if _is_revision_task(t)]
-        if revisions:
-            exam_start = exam_task.start_time or time(9, 0)
-            buffer_min = 5
-
-            # Move the highest-priority revision task to finish right before exam.
-            rev = revisions[0]
-            rev_duration = _task_duration_minutes(rev)
-            rev_end_dt = datetime.combine(exam_task.date, exam_start) - timedelta(minutes=buffer_min)
-            rev_start_dt = rev_end_dt - timedelta(minutes=rev_duration)
-            day_start = datetime.combine(exam_task.date, time(9, 0))
-            if rev_start_dt < day_start:
-                rev_start_dt = day_start
-                rev_end_dt = rev_start_dt + timedelta(minutes=rev_duration)
-
-            rev.start_time = rev_start_dt.time()
-            rev.end_time = rev_end_dt.time()
-            db.commit()
-            db.refresh(rev)
-            pinned_ids.add(rev.id)
-
-    # Rebalance around pinned tasks (at minimum the exam task).
-    rebalance_day(db, exam_task.date, pinned_task_ids=pinned_ids)
-
-    refreshed = (
-        db.query(Task)
-        .filter(Task.date == exam_task.date, Task.completed == False)
-        .order_by(Task.start_time.asc(), Task.priority.desc())
-        .all()
-    )
-    changed = []
-    for task in refreshed:
-        after = (task.date, task.start_time, task.end_time)
-        before = before_state.get(task.id)
-        if before != after:
-            changed.append(task)
-
-    return changed
 
 @app.post("/tasks", response_model=TaskResponse)
 def create_task_endpoint(
@@ -333,54 +70,152 @@ def create_reflection_endpoint(
         db=db,
     )
 
-@app.post("/chat", response_model=List[TaskResponse])
+@app.post("/chat", response_model=ChatResponse)
 def chat_create_task_endpoint(
     input: ChatInput,
     db: Session = Depends(get_db)
 ):
+    def _build_response(
+        mode: str,
+        message: str,
+        created_tasks=None,
+        updated_tasks=None,
+        unchanged_tasks=None,
+        used_fallback_parser: bool = False,
+        used_replan_handler: bool = False,
+        affected_dates=None,
+        warnings=None,
+    ) -> ChatResponse:
+        created_tasks = created_tasks or []
+        updated_tasks = updated_tasks or []
+        unchanged_tasks = unchanged_tasks or []
+        affected_dates = sorted(list(affected_dates or []))
+        warnings = warnings or []
+
+        created_ids = {t.id for t in created_tasks}
+        updated_ids = {t.id for t in updated_tasks}
+        unscheduled = []
+        for task in created_tasks + updated_tasks + unchanged_tasks:
+            if task.id in {t.id for t in unscheduled}:
+                continue
+            if (not task.start_time) or (not task.end_time):
+                unscheduled.append(task)
+
+        unchanged_filtered = [t for t in unchanged_tasks if t.id not in created_ids and t.id not in updated_ids]
+
+        return ChatResponse(
+            mode=mode,
+            message=message,
+            created_tasks=created_tasks,
+            updated_tasks=updated_tasks,
+            unchanged_tasks=unchanged_filtered,
+            unscheduled_tasks=unscheduled,
+            meta=ChatMeta(
+                used_fallback_parser=used_fallback_parser,
+                used_replan_handler=used_replan_handler,
+                affected_dates=affected_dates,
+                warnings=warnings,
+            ),
+        )
+
+    def _collect_updated_tasks_for_dates(before_state_by_date, dates):
+        updated = []
+        seen = set()
+        for d in dates:
+            before_state = before_state_by_date.get(d, {})
+            refreshed = (
+                db.query(Task)
+                .filter(Task.date == d, Task.completed == False)
+                .order_by(Task.start_time.asc(), Task.priority.desc(), Task.id.asc())
+                .all()
+            )
+            for task in refreshed:
+                if task.id not in before_state:
+                    continue
+                before = before_state[task.id]
+                after = (task.date, task.start_time, task.end_time)
+                if before != after and task.id not in seen:
+                    updated.append(task)
+                    seen.add(task.id)
+        return updated
+
     today = date.today()
-    context = _build_schedule_context(db, today=today)
+    context = build_schedule_context(db, today=today)
     model_input = (
         "Existing schedule context (use this for follow-up commands):\n"
         f"{context}\n\n"
         f"User message:\n{input.message}"
     )
     decision = scheduler_agent.decide(model_input)
+    fallback_multi = split_tasks_from_message(input.message)
+    used_fallback_parser = False
 
     if decision.action != "create_task":
-        replanned = _handle_followup_replan(input.message, db)
+        replanned = handle_followup_replan(input.message, db)
         if replanned:
-            return replanned
+            return _build_response(
+                mode="replan",
+                message="Updated existing tasks based on your follow-up request.",
+                updated_tasks=replanned,
+                used_replan_handler=True,
+                affected_dates={t.date for t in replanned},
+            )
         if decision.action == "get_schedule":
-            return get_schedule(today, db)
-        # Do not hard-fail on model action drift for follow-up commands.
-        return []
+            tasks = get_schedule(today, db)
+            return _build_response(
+                mode="schedule",
+                message="Here is your schedule.",
+                unchanged_tasks=tasks,
+                affected_dates={today},
+            )
+        # If model action drifts but input clearly contains task items, continue with local extraction.
+        if not fallback_multi:
+            return _build_response(
+                mode="replan",
+                message="No matching task updates were applied.",
+                used_replan_handler=True,
+                warnings=["No matching tasks found for this follow-up request."],
+            )
+        args_list = fallback_multi
+        used_fallback_parser = True
+    else:
+        args_list = decision.arguments
 
-    tasks_out = []
-    args_list = decision.arguments
+    created_tasks = []
 
     if isinstance(args_list, dict):
         args_list = [args_list]
 
-    fallback_multi = _split_tasks_from_message(input.message)
     if not args_list:
         args_list = fallback_multi
+        used_fallback_parser = True
     elif len(args_list) == 1:
         only = args_list[0] or {}
         only_title = (only.get("title") or "").strip().lower()
         input_clean = input.message.strip().lower()
         if len(fallback_multi) > 1 and (not only_title or only_title == input_clean):
             args_list = fallback_multi
+            used_fallback_parser = True
 
     # Track which dates need rebalancing and tasks that should stay fixed
     affected_dates = set()
     pinned_task_ids_by_date = {}
+    before_state_by_date = {}
+
+    def ensure_before_state(target_date):
+        if target_date in before_state_by_date:
+            return
+        tasks = db.query(Task).filter(Task.date == target_date, Task.completed == False).all()
+        before_state_by_date[target_date] = {
+            t.id: (t.date, t.start_time, t.end_time)
+            for t in tasks
+        }
 
     for args in args_list or []:
 
         raw_text = args.get("title") or args.get("description") or input.message
-        text = _title_from_text(raw_text)
-        description = _description_from_text(args.get("description") or raw_text)
+        text = title_from_text(raw_text)
+        description = description_from_text(args.get("description") or raw_text)
         priority = args.get("priority", 1)
 
         task_date_str = args.get("date")
@@ -409,6 +244,12 @@ def chat_create_task_endpoint(
             start_time_val = parse_time(start_time_str.strip())
         if isinstance(end_time_str, str) and end_time_str.strip():
             end_time_val = parse_time(end_time_str.strip())
+
+        # Fallback: if model omitted explicit start_time, infer from text.
+        if not start_time_val:
+            start_time_val = extract_time_from_text(
+                f"{args.get('title') or ''} {args.get('description') or ''} {input.message}"
+            )
 
         effective_date = task_date or today
 
@@ -443,6 +284,7 @@ def chat_create_task_endpoint(
             if deadline_date <= today:
                 session_date = today
                 duration_min = total_effort
+                ensure_before_state(session_date)
 
                 task = create_task(
                     db=db,
@@ -458,7 +300,7 @@ def chat_create_task_endpoint(
                 affected_dates.add(session_date)
                 if start_time_val:
                     pinned_task_ids_by_date.setdefault(session_date, set()).add(task.id)
-                tasks_out.append(task)
+                created_tasks.append(task)
                 continue
 
             days_available = (deadline_date - today).days
@@ -475,6 +317,7 @@ def chat_create_task_endpoint(
                 session_date = today + timedelta(days=i)
                 duration_min = min(base_session, remaining)
                 remaining -= duration_min
+                ensure_before_state(session_date)
 
                 task = create_task(
                     db=db,
@@ -488,7 +331,7 @@ def chat_create_task_endpoint(
                 )
 
                 affected_dates.add(session_date)
-                tasks_out.append(task)
+                created_tasks.append(task)
 
             continue
 
@@ -500,6 +343,7 @@ def chat_create_task_endpoint(
             task_date = today
 
         duration_min = total_effort
+        ensure_before_state(task_date)
 
         task = create_task(
             db=db,
@@ -515,7 +359,7 @@ def chat_create_task_endpoint(
         affected_dates.add(task_date)
         if start_time_val:
             pinned_task_ids_by_date.setdefault(task_date, set()).add(task.id)
-        tasks_out.append(task)
+        created_tasks.append(task)
 
     # ======================================================
     # 🔥 REBALANCE AFTER ALL CREATIONS
@@ -528,7 +372,18 @@ def chat_create_task_endpoint(
             pinned_task_ids=pinned_task_ids_by_date.get(d, set()),
         )
 
-    return tasks_out
+    updated_tasks = _collect_updated_tasks_for_dates(before_state_by_date, affected_dates)
+    created_ids = {t.id for t in created_tasks}
+    updated_tasks = [t for t in updated_tasks if t.id not in created_ids]
+
+    return _build_response(
+        mode="create",
+        message="Created and scheduled tasks.",
+        created_tasks=created_tasks,
+        updated_tasks=updated_tasks,
+        used_fallback_parser=used_fallback_parser,
+        affected_dates=affected_dates,
+    )
 
 @app.get("/tasks", response_model=List[TaskResponse])
 def get_tasks_endpoint(task_date: date, db: Session = Depends(get_db)):
