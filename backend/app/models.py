@@ -1,13 +1,14 @@
 from app.db import Base
 from sqlalchemy import (
-    create_engine,
     Column,
     Integer,
     String,
     Boolean,
     Date,
     Time,
+    DateTime,
 )
+from datetime import datetime
 
 
 class Task(Base):
@@ -51,3 +52,19 @@ class DurationStats(Base):
     energy = Column(Integer)  # 1–5
     avg_delta = Column(Integer, default=0)
     count = Column(Integer, default=0)
+
+
+class ConversationThread(Base):
+    __tablename__ = "conversation_threads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    thread_key = Column(String, unique=True, index=True, nullable=False)
+    thread_date = Column(Date, index=True, nullable=False)
+    chat_thread_id = Column(String, index=True, nullable=True)
+    last_intent_type = Column(String, nullable=True)
+    last_user_message = Column(String, nullable=True)
+    last_created_task_ids = Column(String, nullable=True)      # JSON string
+    last_updated_task_ids = Column(String, nullable=True)      # JSON string
+    last_referenced_task_ids = Column(String, nullable=True)   # JSON string
+    updated_at = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

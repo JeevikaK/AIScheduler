@@ -1,10 +1,11 @@
 from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, List
 import re
+import json
 
 from sqlalchemy.orm import Session
 
-from app.models import Mood, Task
+from app.models import ConversationThread, Mood, Task
 from app.schemas import ChatMeta, ChatResponse
 from services.planner import get_historical_avg_duration, infer_task_type, rebalance_day
 from services.scheduling import extract_date_from_text, infer_duration_minutes, parse_time
@@ -15,6 +16,103 @@ STOP_WORDS = {
     "our", "your", "with", "from", "by", "it", "this", "that", "please", "plan", "day",
     "move", "moved", "earlier", "later", "before", "after", "around", "about",
 }
+
+def _parse_ids(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            out = []
+            for item in data:
+                try:
+                    out.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+            return out
+    except Exception:
+        return []
+    return []
+
+
+def _dump_ids(ids: list[int]) -> str:
+    return json.dumps([int(i) for i in ids])
+
+
+def resolve_thread_key(chat_thread_id: str | None, thread_date: date) -> str:
+    base = (chat_thread_id or "").strip()
+    if base:
+        return f"{base}:{thread_date.isoformat()}"
+    return f"auto:{thread_date.isoformat()}"
+
+
+def load_thread_state(db: Session, thread_key: str) -> dict:
+    rec = db.query(ConversationThread).filter(ConversationThread.thread_key == thread_key).first()
+    if not rec:
+        return {
+            "thread_key": thread_key,
+            "chat_thread_id": None,
+            "thread_date": None,
+            "last_intent_type": None,
+            "last_user_message": None,
+            "last_created_task_ids": [],
+            "last_updated_task_ids": [],
+            "last_referenced_task_ids": [],
+        }
+    return {
+        "thread_key": rec.thread_key,
+        "chat_thread_id": rec.chat_thread_id,
+        "thread_date": rec.thread_date,
+        "last_intent_type": rec.last_intent_type,
+        "last_user_message": rec.last_user_message,
+        "last_created_task_ids": _parse_ids(rec.last_created_task_ids),
+        "last_updated_task_ids": _parse_ids(rec.last_updated_task_ids),
+        "last_referenced_task_ids": _parse_ids(rec.last_referenced_task_ids),
+    }
+
+
+def save_thread_state(db: Session, thread_key: str, payload: dict) -> None:
+    rec = db.query(ConversationThread).filter(ConversationThread.thread_key == thread_key).first()
+    if not rec:
+        rec = ConversationThread(
+            thread_key=thread_key,
+            thread_date=payload.get("thread_date") or date.today(),
+            chat_thread_id=payload.get("chat_thread_id"),
+        )
+        db.add(rec)
+
+    if payload.get("thread_date"):
+        rec.thread_date = payload["thread_date"]
+    rec.chat_thread_id = payload.get("chat_thread_id")
+    rec.last_intent_type = payload.get("last_intent_type")
+    rec.last_user_message = payload.get("last_user_message")
+    rec.last_created_task_ids = _dump_ids(payload.get("last_created_task_ids", []))
+    rec.last_updated_task_ids = _dump_ids(payload.get("last_updated_task_ids", []))
+    rec.last_referenced_task_ids = _dump_ids(payload.get("last_referenced_task_ids", []))
+    rec.updated_at = datetime.utcnow()
+    db.commit()
+
+
+def _thread_summary_for_prompt(db: Session, thread_key: str, thread_state: dict) -> str:
+    def _titles_for(ids: list[int]) -> str:
+        if not ids:
+            return "none"
+        limited = ids[:3]
+        tasks = db.query(Task).filter(Task.id.in_(limited)).all()
+        title_map = {t.id: t.title for t in tasks}
+        parts = []
+        for i in limited:
+            title = title_map.get(i, "missing")
+            parts.append(f"{i}:{title}")
+        return ", ".join(parts) if parts else "none"
+
+    return (
+        f"Thread key: {thread_key}\n"
+        f"Last intent: {thread_state.get('last_intent_type') or 'none'}\n"
+        f"Last created: {_titles_for(thread_state.get('last_created_task_ids', []))}\n"
+        f"Last updated: {_titles_for(thread_state.get('last_updated_task_ids', []))}\n"
+        f"Last referenced: {_titles_for(thread_state.get('last_referenced_task_ids', []))}"
+    )
 
 
 def _has_explicit_date_cue(text: str) -> bool:
@@ -245,12 +343,37 @@ def build_schedule_context(db: Session, today: date, days: int = 7) -> str:
     return "\n".join(lines)
 
 
-def handle_followup_replan(message: str, db: Session) -> List[Task]:
-    today = date.today()
+def handle_followup_replan(
+    message: str,
+    db: Session,
+    thread_state: dict | None = None,
+    reference_date: date | None = None,
+    return_metadata: bool = False,
+):
+    today = reference_date or date.today()
     text = (message or "").lower()
     if not text.strip():
-        return []
+        return ([], {"memory_used": False, "referenced_task_ids": []}) if return_metadata else []
     requested_time = extract_time_from_text(message)
+
+    memory_order = []
+    if thread_state:
+        memory_order = (
+            thread_state.get("last_referenced_task_ids", [])
+            + thread_state.get("last_updated_task_ids", [])
+            + thread_state.get("last_created_task_ids", [])
+        )
+    seen_memory = set()
+    ordered_memory_ids = []
+    for tid in memory_order:
+        try:
+            tid_int = int(tid)
+        except (TypeError, ValueError):
+            continue
+        if tid_int in seen_memory:
+            continue
+        seen_memory.add(tid_int)
+        ordered_memory_ids.append(tid_int)
 
     upcoming = (
         db.query(Task)
@@ -258,14 +381,38 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
         .order_by(Task.date.asc(), Task.start_time.asc(), Task.priority.desc())
         .all()
     )
-    if not upcoming:
-        return []
+    memory_tasks = []
+    if ordered_memory_ids:
+        memory_rows = (
+            db.query(Task)
+            .filter(Task.id.in_(ordered_memory_ids), Task.completed == False)
+            .all()
+        )
+        by_id = {t.id: t for t in memory_rows}
+        memory_tasks = [by_id[i] for i in ordered_memory_ids if i in by_id]
+
+    pool_by_id = {}
+    for t in upcoming + memory_tasks:
+        pool_by_id[t.id] = t
+    candidate_tasks = list(pool_by_id.values())
+
+    if not candidate_tasks:
+        return ([], {"memory_used": False, "referenced_task_ids": []}) if return_metadata else []
+
+    meta = {"memory_used": False, "referenced_task_ids": []}
 
     def _tokenize(s: str) -> set[str]:
-        return {
-            w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
-            if len(w) > 1 and w not in STOP_WORDS
-        }
+        tokens = set()
+        for w in re.findall(r"[a-z0-9]+", (s or "").lower()):
+            if len(w) <= 1 or w in STOP_WORDS:
+                continue
+            tokens.add(w)
+            # lightweight normalization for gerunds/plurals to improve matching.
+            if len(w) > 4 and w.endswith("ing"):
+                tokens.add(w[:-3])
+            if len(w) > 3 and w.endswith("s"):
+                tokens.add(w[:-1])
+        return tokens
 
     def _task_tokens(task: Task) -> set[str]:
         return _tokenize(f"{task.title or ''} {task.description or ''}")
@@ -344,12 +491,35 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
         return None
 
     all_tokens = _tokenize(text)
-    anchor = _pick_best_task(upcoming, all_tokens)
+    anchor = _pick_best_task(candidate_tasks, all_tokens) if all_tokens else None
     pronoun_ref = bool(re.search(r"\b(it|that|this|one)\b", text))
 
+    if not anchor and thread_state:
+        id_to_task = {t.id: t for t in candidate_tasks}
+        # Prefer same-day references first, then any-date fallback.
+        same_day_candidates = []
+        any_day_candidates = []
+        for tid in memory_order:
+            candidate = id_to_task.get(tid)
+            if not candidate:
+                continue
+            if candidate.date == today:
+                same_day_candidates.append(candidate)
+            else:
+                any_day_candidates.append(candidate)
+        if same_day_candidates:
+            anchor = same_day_candidates[0]
+            meta["memory_used"] = True
+        elif any_day_candidates:
+            anchor = any_day_candidates[0]
+            meta["memory_used"] = True
+
+    if not anchor and all_tokens:
+        anchor = _pick_best_task(candidate_tasks, all_tokens)
+
     if not anchor and pronoun_ref:
-        # Immediate-context fallback: treat pronouns as most recently created/upated task.
-        anchor = max(upcoming, key=lambda t: t.id)
+        # Immediate-context fallback: treat pronouns as most recently created/updated task.
+        anchor = max(candidate_tasks, key=lambda t: t.id)
 
     if not requested_time:
         requested_time = _extract_change_to_time(message, anchor)
@@ -357,10 +527,10 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
     if not anchor:
         if requested_time:
             # If only a time is given, use most recent scheduled task as likely referent.
-            scheduled = [t for t in upcoming if t.start_time]
-            anchor = max(scheduled, key=lambda t: t.id) if scheduled else max(upcoming, key=lambda t: t.id)
+            scheduled = [t for t in candidate_tasks if t.start_time]
+            anchor = max(scheduled, key=lambda t: t.id) if scheduled else max(candidate_tasks, key=lambda t: t.id)
         else:
-            return []
+            return ([], meta) if return_metadata else []
 
     direction = None
     if any(k in text for k in ["earlier", "before", "ahead"]):
@@ -376,6 +546,81 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
     )
     if move_match:
         move_target_tokens = _tokenize(move_match.group(1))
+
+    # Support patterns like "move talking to mom from 6 to 7:30"
+    move_from_to_match = re.search(
+        r"\bmove\s+(?:the\s+)?(.+?)\s+from\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+to\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    from_to_from_token = None
+    from_to_to_token = None
+    if move_from_to_match:
+        move_target_tokens = _tokenize(move_from_to_match.group(1))
+        from_to_from_token = move_from_to_match.group(2)
+        from_to_to_token = move_from_to_match.group(3)
+
+    def _parse_from_time_variants(raw: str):
+        if not raw:
+            return []
+        m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", raw, flags=re.IGNORECASE)
+        if not m:
+            return []
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        meridian = (m.group(3) or "").lower()
+        variants = []
+        if meridian:
+            if meridian == "pm" and hour != 12:
+                hour += 12
+            elif meridian == "am" and hour == 12:
+                hour = 0
+            variants.append(time(hour, minute))
+        else:
+            if 0 <= hour <= 23:
+                variants.append(time(hour, minute))
+            if 1 <= hour <= 11:
+                variants.append(time(hour + 12, minute))
+        # dedupe
+        uniq = []
+        for v in variants:
+            if v not in uniq:
+                uniq.append(v)
+        return uniq
+
+    # If user explicitly says "move <task> ...", force anchor by that phrase first.
+    if move_target_tokens:
+        targeted_anchor = _pick_best_task(candidate_tasks, move_target_tokens)
+        if targeted_anchor:
+            anchor = targeted_anchor
+        elif from_to_from_token:
+            from_variants = _parse_from_time_variants(from_to_from_token)
+            if from_variants:
+                candidates = [
+                    t for t in candidate_tasks
+                    if t.start_time and any((t.start_time.hour == fv.hour and t.start_time.minute == fv.minute) for fv in from_variants)
+                ]
+                if candidates:
+                    # If multiple tasks at same from-time, pick best semantic match.
+                    semantic = _pick_best_task(candidates, move_target_tokens)
+                    anchor = semantic or max(candidates, key=lambda t: t.id)
+    elif from_to_from_token and not anchor:
+        # Fallback for "move ... from A to B" when text tokens are noisy.
+        from_variants = _parse_from_time_variants(from_to_from_token)
+        if from_variants:
+            candidates = [
+                t for t in candidate_tasks
+                if t.start_time and any((t.start_time.hour == fv.hour and t.start_time.minute == fv.minute) for fv in from_variants)
+            ]
+            if candidates:
+                anchor = max(candidates, key=lambda t: t.id)
+
+    # In "move X from A to B", resolve destination time after anchor is known so AM/PM can inherit from anchor.
+    if from_to_to_token:
+        requested_time = _extract_change_to_time(
+            f"change to {from_to_to_token}",
+            anchor,
+        ) or requested_time
 
     target_date = anchor.date
     # Snapshot day state so we can return only changed tasks.
@@ -396,6 +641,7 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
             datetime.combine(anchor.date, requested_time) + timedelta(minutes=duration)
         ).time()
         pinned_ids.add(anchor.id)
+        meta["referenced_task_ids"].append(anchor.id)
 
     # Relative move request for an explicitly mentioned task phrase.
     if direction and move_target_tokens:
@@ -440,6 +686,7 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
             related.start_time = start_dt.time()
             related.end_time = end_dt.time()
             pinned_ids.add(related.id)
+            meta["referenced_task_ids"].append(related.id)
 
     # Generic "move earlier/later" without explicit phrase: shift anchor by 30 mins.
     elif direction and not requested_time and anchor.start_time:
@@ -453,6 +700,7 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
         anchor.start_time = shifted_start.time()
         anchor.end_time = shifted_end.time()
         pinned_ids.add(anchor.id)
+        meta["referenced_task_ids"].append(anchor.id)
 
     db.commit()
 
@@ -472,6 +720,10 @@ def handle_followup_replan(message: str, db: Session) -> List[Task]:
         if before != after:
             changed.append(task)
 
+    if not meta["referenced_task_ids"]:
+        meta["referenced_task_ids"] = [t.id for t in changed][:10]
+    if return_metadata:
+        return changed, meta
     return changed
 
 
@@ -483,6 +735,8 @@ def _build_response(
     unchanged_tasks=None,
     used_fallback_parser: bool = False,
     used_replan_handler: bool = False,
+    resolved_thread_key: str | None = None,
+    memory_used: bool = False,
     affected_dates=None,
     warnings=None,
 ) -> ChatResponse:
@@ -515,6 +769,8 @@ def _build_response(
         meta=ChatMeta(
             used_fallback_parser=used_fallback_parser,
             used_replan_handler=used_replan_handler,
+            resolved_thread_key=resolved_thread_key,
+            memory_used=memory_used,
             affected_dates=affected_dates,
             warnings=warnings,
         ),
@@ -543,12 +799,24 @@ def _collect_updated_tasks_for_dates(db: Session, before_state_by_date, dates):
     return updated
 
 
-def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], Any]) -> ChatResponse:
+def process_chat_request(
+    message: str,
+    db: Session,
+    decide_fn: Callable[[str], Any],
+    chat_thread_id: str | None = None,
+    thread_date: date | None = None,
+) -> ChatResponse:
     today = date.today()
-    context = build_schedule_context(db, today=today)
+    effective_thread_date = thread_date or today
+    thread_key = resolve_thread_key(chat_thread_id, effective_thread_date)
+    thread_state = load_thread_state(db, thread_key)
+    context = build_schedule_context(db, today=effective_thread_date)
+    thread_summary = _thread_summary_for_prompt(db, thread_key, thread_state)
     model_input = (
         "Existing schedule context (use this for follow-up commands):\n"
         f"{context}\n\n"
+        "Thread memory summary:\n"
+        f"{thread_summary}\n\n"
         f"User message:\n{message}"
     )
     decision = decide_fn(model_input)
@@ -556,29 +824,81 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
     used_fallback_parser = False
 
     if decision.action != "create_task":
-        replanned = handle_followup_replan(message, db)
+        replanned, replan_meta = handle_followup_replan(
+            message,
+            db,
+            thread_state=thread_state,
+            reference_date=effective_thread_date,
+            return_metadata=True,
+        )
         if replanned:
+            referenced_ids = [t.id for t in replanned][:10]
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "replan",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": referenced_ids,
+                    "last_referenced_task_ids": referenced_ids,
+                },
+            )
             return _build_response(
                 mode="replan",
                 message="Updated existing tasks based on your follow-up request.",
                 updated_tasks=replanned,
                 used_replan_handler=True,
+                resolved_thread_key=thread_key,
+                memory_used=bool(replan_meta.get("memory_used")),
                 affected_dates={t.date for t in replanned},
             )
         if decision.action == "get_schedule":
-            tasks = get_schedule(today, db)
+            tasks = get_schedule(effective_thread_date, db)
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "schedule",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                },
+            )
             return _build_response(
                 mode="schedule",
                 message="Here is your schedule.",
                 unchanged_tasks=tasks,
-                affected_dates={today},
+                resolved_thread_key=thread_key,
+                memory_used=False,
+                affected_dates={effective_thread_date},
             )
         # If model action drifts but input clearly contains task items, continue with local extraction.
         if not fallback_multi:
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "replan",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                },
+            )
             return _build_response(
                 mode="replan",
                 message="No matching task updates were applied.",
                 used_replan_handler=True,
+                resolved_thread_key=thread_key,
+                memory_used=bool(replan_meta.get("memory_used")),
                 warnings=["No matching tasks found for this follow-up request."],
             )
         args_list = fallback_multi
@@ -639,7 +959,7 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
         if deadline_str:
             deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
 
-        today = date.today()
+        base_date = effective_thread_date
 
         # Parse explicit times when provided
         start_time_val = None
@@ -655,7 +975,7 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
                 f"{args.get('title') or ''} {args.get('description') or ''} {message}"
             )
 
-        effective_date = task_date or today
+        effective_date = task_date or base_date
 
         # Duration fallback
         if not total_effort:
@@ -678,8 +998,8 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
 
         # Spread logic
         if spread and deadline_date:
-            if deadline_date <= today:
-                session_date = today
+            if deadline_date <= base_date:
+                session_date = base_date
                 duration_min = total_effort
                 ensure_before_state(session_date)
                 task = create_task(
@@ -698,7 +1018,7 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
                 created_tasks.append(task)
                 continue
 
-            days_available = (deadline_date - today).days
+            days_available = (deadline_date - base_date).days
             days_to_plan = min(max(days_available, 1), 7)
             base_session = max(45, total_effort // days_to_plan)
             remaining = total_effort
@@ -706,7 +1026,7 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
             for i in range(days_to_plan):
                 if remaining <= 0:
                     break
-                session_date = today + timedelta(days=i)
+                session_date = base_date + timedelta(days=i)
                 duration_min = min(base_session, remaining)
                 remaining -= duration_min
                 ensure_before_state(session_date)
@@ -726,7 +1046,7 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
 
         # Single-day task
         if not task_date:
-            task_date = today
+            task_date = base_date
         duration_min = total_effort
         ensure_before_state(task_date)
         task = create_task(
@@ -755,11 +1075,30 @@ def process_chat_request(message: str, db: Session, decide_fn: Callable[[str], A
     created_ids = {t.id for t in created_tasks}
     updated_tasks = [t for t in updated_tasks if t.id not in created_ids]
 
+    created_ids = [t.id for t in created_tasks][:10]
+    updated_ids = [t.id for t in updated_tasks][:10]
+    referenced_ids = (updated_ids + created_ids)[:10]
+    save_thread_state(
+        db,
+        thread_key,
+        {
+            "thread_date": effective_thread_date,
+            "chat_thread_id": chat_thread_id,
+            "last_intent_type": "create",
+            "last_user_message": message,
+            "last_created_task_ids": created_ids,
+            "last_updated_task_ids": updated_ids,
+            "last_referenced_task_ids": referenced_ids,
+        },
+    )
+
     return _build_response(
         mode="create",
         message="Created and scheduled tasks.",
         created_tasks=created_tasks,
         updated_tasks=updated_tasks,
         used_fallback_parser=used_fallback_parser,
+        resolved_thread_key=thread_key,
+        memory_used=False,
         affected_dates=affected_dates,
     )

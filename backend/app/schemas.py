@@ -2,6 +2,7 @@ from datetime import time, date
 from typing import List, Optional
 from pydantic import BaseModel, Field
 from app.db import Base, engine
+from app import models as _models  # noqa: F401  # ensure model registration before create_all
 
 class TaskBase(BaseModel):
     title: str
@@ -56,10 +57,14 @@ class ReflectionResponse(ReflectionCreate):
 
 class ChatInput(BaseModel):
     message: str
+    chat_thread_id: Optional[str] = None
+    thread_date: Optional[date] = None
 
 class ChatMeta(BaseModel):
     used_fallback_parser: bool = False
     used_replan_handler: bool = False
+    resolved_thread_key: Optional[str] = None
+    memory_used: bool = False
     affected_dates: List[date] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
 
