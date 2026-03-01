@@ -66,5 +66,8 @@ class ConversationThread(Base):
     last_created_task_ids = Column(String, nullable=True)      # JSON string
     last_updated_task_ids = Column(String, nullable=True)      # JSON string
     last_referenced_task_ids = Column(String, nullable=True)   # JSON string
+    pending_intent_id = Column(String, nullable=True)
+    pending_state_type = Column(String, nullable=True)         # clarification | conflict_resolution
+    pending_state_json = Column(String, nullable=True)         # JSON object
     updated_at = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

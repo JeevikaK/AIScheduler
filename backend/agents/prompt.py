@@ -55,6 +55,29 @@ Use replan_day for follow-ups like:
 - "shift my study block"
 - "exam is at 9am, adjust prep"
 
+If follow-up target is ambiguous, prefer ask_user instead of guessing a task.
+
+--------------------------------------------------
+ASK_USER FORMAT
+--------------------------------------------------
+
+If action is ask_user:
+
+{{
+  "action": "ask_user",
+  "arguments": {{
+    "field": "<required field name>",
+    "question": "<clear clarification question>",
+    "options": [
+      {{"id": "opt-1", "label": "Option label", "value": "option_value"}}
+    ]
+  }}
+}}
+
+- `field` and `question` are required.
+- Include options whenever there are obvious choices.
+- Use ask_user when key scheduling info is missing or ambiguous.
+
 --------------------------------------------------
 CREATE_TASK FORMAT
 --------------------------------------------------

@@ -73,6 +73,8 @@ def chat_create_task_endpoint(
         decide_fn=scheduler_agent.decide,
         chat_thread_id=input.chat_thread_id,
         thread_date=input.thread_date,
+        pending_response=input.pending_response,
+        confirm=input.confirm,
     )
 
 @app.get("/tasks", response_model=List[TaskResponse])

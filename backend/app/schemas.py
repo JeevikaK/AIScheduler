@@ -1,5 +1,5 @@
 from datetime import time, date
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import BaseModel, Field
 from app.db import Base, engine
 from app import models as _models  # noqa: F401  # ensure model registration before create_all
@@ -59,12 +59,57 @@ class ChatInput(BaseModel):
     message: str
     chat_thread_id: Optional[str] = None
     thread_date: Optional[date] = None
+    pending_response: Optional[dict[str, Any]] = None
+    confirm: Optional[bool] = None
+
+
+class ClarificationOption(BaseModel):
+    id: str
+    label: str
+    value: str
+
+
+class ClarificationPrompt(BaseModel):
+    intent_id: str
+    question: str
+    field: str
+    options: List[ClarificationOption] = Field(default_factory=list)
+    allow_free_text: bool = True
+
+
+class ConflictTaskRef(BaseModel):
+    task_id: int
+    title: str
+    date: date
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    is_fixed: bool = False
+
+
+class SlotSuggestion(BaseModel):
+    slot_id: str
+    date: date
+    start_time: time
+    end_time: time
+    score: float
+    reason: str
+
+
+class ConflictPrompt(BaseModel):
+    intent_id: str
+    new_task_draft: dict[str, Any]
+    conflicting_tasks: List[ConflictTaskRef] = Field(default_factory=list)
+    suggested_slots: List[SlotSuggestion] = Field(default_factory=list)
+    actions: List[str] = Field(default_factory=list)
 
 class ChatMeta(BaseModel):
     used_fallback_parser: bool = False
     used_replan_handler: bool = False
     resolved_thread_key: Optional[str] = None
     memory_used: bool = False
+    requires_user_input: bool = False
+    pending_intent_id: Optional[str] = None
+    applied_after_confirmation: bool = False
     affected_dates: List[date] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
 
@@ -75,6 +120,8 @@ class ChatResponse(BaseModel):
     updated_tasks: List[TaskResponse] = Field(default_factory=list)
     unchanged_tasks: List[TaskResponse] = Field(default_factory=list)
     unscheduled_tasks: List[TaskResponse] = Field(default_factory=list)
+    clarification: Optional[ClarificationPrompt] = None
+    conflict_info: Optional[ConflictPrompt] = None
     meta: ChatMeta
 
 class DailyScheduleResponse(BaseModel):

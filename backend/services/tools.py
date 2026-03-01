@@ -7,7 +7,7 @@ from services.scheduling import extract_date_from_text, infer_duration_minutes
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from app.models import Reflection, Task, Mood
-from app.schemas import ChatInput, ReflectionCreate, TaskCreate, MoodCreate, TaskReflectionInput
+from app.schemas import ReflectionCreate, TaskReflectionInput
 from fastapi import Depends, Query
 
 def infer_priority(text: str):

@@ -358,8 +358,25 @@ def store_duration_delta(
     db.commit()
 
 def parse_time(time_str: str) -> time:
-    """Parse a time string that may or may not have seconds."""
-    try:
-        return datetime.strptime(time_str, "%H:%M:%S").time()
-    except ValueError:
-        return datetime.strptime(time_str, "%H:%M").time()
+    """
+    Parse common time formats:
+    - 24h: HH:MM, HH:MM:SS
+    - 12h: hAM/PM, h:MM AM/PM (case-insensitive, optional space)
+    """
+    raw = (time_str or "").strip()
+    normalized = re.sub(r"\s+", " ", raw).lower()
+    # Normalize "6pm" -> "6 pm", "6:30pm" -> "6:30 pm"
+    normalized = re.sub(r"^(\d{1,2}(?::\d{2})?)\s*(am|pm)$", r"\1 \2", normalized)
+
+    fmts = [
+        "%H:%M:%S",
+        "%H:%M",
+        "%I:%M %p",
+        "%I %p",
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(normalized, fmt).time()
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported time format: {time_str!r}")
