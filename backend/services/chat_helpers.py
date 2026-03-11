@@ -1689,6 +1689,183 @@ def handle_pending_resolution(
             )
         draft = pending_state.get("draft") or {}
         field = pending_state.get("field")
+        if pending_state.get("mode") == "multi_create":
+            drafts = pending_state.get("drafts") or []
+            pending_index = int(pending_state.get("pending_index") or 0)
+            awaiting_free_time = bool(pending_state.get("awaiting_free_time"))
+            if pending_index < 0 or pending_index >= len(drafts):
+                pending_index = 0
+
+            if awaiting_free_time:
+                parsed_time = extract_time_from_text(action_value) if isinstance(action_value, str) else None
+                if not parsed_time:
+                    return _build_multi_create_prompt(
+                        db=db,
+                        thread_key=thread_key,
+                        thread_state=thread_state,
+                        effective_thread_date=effective_thread_date,
+                        chat_thread_id=chat_thread_id,
+                        message=message,
+                        drafts=drafts,
+                        pending_index=pending_index,
+                        awaiting_free_time=True,
+                    )
+            else:
+                if isinstance(action_value, str) and action_value.strip().lower() == "other_time":
+                    return _build_multi_create_prompt(
+                        db=db,
+                        thread_key=thread_key,
+                        thread_state=thread_state,
+                        effective_thread_date=effective_thread_date,
+                        chat_thread_id=chat_thread_id,
+                        message=message,
+                        drafts=drafts,
+                        pending_index=pending_index,
+                        awaiting_free_time=True,
+                    )
+                parsed_time = None
+                if isinstance(action_value, str):
+                    parsed_time = extract_time_from_text(action_value)
+                    if not parsed_time and action_from_payload:
+                        try:
+                            parsed_time = parse_time(action_value)
+                        except Exception:
+                            parsed_time = None
+                if not parsed_time:
+                    return _build_multi_create_prompt(
+                        db=db,
+                        thread_key=thread_key,
+                        thread_state=thread_state,
+                        effective_thread_date=effective_thread_date,
+                        chat_thread_id=chat_thread_id,
+                        message=message,
+                        drafts=drafts,
+                        pending_index=pending_index,
+                        awaiting_free_time=False,
+                    )
+
+            current = drafts[pending_index]
+            task_date = datetime.strptime(current["date"], "%Y-%m-%d").date()
+            duration = int(current.get("duration_minutes") or 60)
+            end_time = (datetime.combine(task_date, parsed_time) + timedelta(minutes=duration)).time()
+            if current.get("min_start_time"):
+                try:
+                    min_start = parse_time(current["min_start_time"])
+                    if parsed_time < min_start:
+                        return _build_multi_create_prompt(
+                            db=db,
+                            thread_key=thread_key,
+                            thread_state=thread_state,
+                            effective_thread_date=effective_thread_date,
+                            chat_thread_id=chat_thread_id,
+                            message=message,
+                            drafts=drafts,
+                            pending_index=pending_index,
+                        )
+                except Exception:
+                    pass
+            current["start_time"] = parsed_time.strftime("%H:%M:%S")
+            current["end_time"] = end_time.strftime("%H:%M:%S")
+            drafts[pending_index] = current
+
+            # Check conflict for chosen time
+            conflicts, suggestions = detect_conflicts_for_draft(
+                db,
+                {
+                    "title": current.get("title"),
+                    "description": current.get("description"),
+                    "date": task_date,
+                    "start_time": parsed_time,
+                    "end_time": end_time,
+                    "duration_minutes": duration,
+                    "priority": int(current.get("priority") or 1),
+                },
+            )
+            if conflicts:
+                pending_intent_id = str(uuid.uuid4())
+                save_thread_state(
+                    db,
+                    thread_key,
+                    {
+                        "thread_date": effective_thread_date,
+                        "chat_thread_id": chat_thread_id,
+                        "last_intent_type": "conflict",
+                        "last_user_message": message,
+                        "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                        "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                        "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                        "pending_intent_id": pending_intent_id,
+                        "pending_state_type": "conflict_resolution",
+                        "pending_state": {
+                            "mode": "multi_create_conflict",
+                            "drafts": drafts,
+                            "draft_index": pending_index,
+                            "pending_index": pending_index,
+                            "draft": current,
+                            "conflict_ids": [t.id for t in conflicts],
+                            "suggestions": [
+                                {
+                                    "slot_id": s["slot_id"],
+                                    "date": s["date"].isoformat(),
+                                    "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                    "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                    "score": float(s["score"]),
+                                    "reason": s["reason"],
+                                }
+                                for s in suggestions
+                            ],
+                        },
+                    },
+                )
+                return _build_response(
+                    mode="conflict",
+                    message="That time conflicts with an existing task. Choose a different slot.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=_build_conflict_prompt(
+                        intent_id=pending_intent_id,
+                        draft={
+                            "title": current.get("title"),
+                            "description": current.get("description"),
+                            "date": task_date,
+                            "start_time": parsed_time,
+                            "end_time": end_time,
+                            "duration_minutes": duration,
+                            "priority": int(current.get("priority") or 1),
+                        },
+                        conflicts=conflicts,
+                        suggestions=suggestions,
+                        actions=["choose_slot:<slot_id>", "cancel"],
+                    ),
+                )
+
+            # Advance to next draft missing time.
+            next_index = pending_index + 1
+            while next_index < len(drafts):
+                if not drafts[next_index].get("start_time"):
+                    break
+                next_index += 1
+            if next_index < len(drafts):
+                return _build_multi_create_prompt(
+                    db=db,
+                    thread_key=thread_key,
+                    thread_state=thread_state,
+                    effective_thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    message=message,
+                    drafts=drafts,
+                    pending_index=next_index,
+                )
+            return _finalize_multi_create(
+                db=db,
+                thread_key=thread_key,
+                thread_state=thread_state,
+                effective_thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                message=message,
+                drafts=drafts,
+            )
         if pending_state.get("intent") == "replan":
             if isinstance(action_value, str) and action_value.strip().lower() == "cancel":
                 _clear_pending_state(
@@ -2084,7 +2261,7 @@ def handle_pending_resolution(
             }
             for s in suggestions
         ],
-        actions=["choose_slot:<slot_id>", "cancel"] if mode == "replan" else None,
+        actions=["choose_slot:<slot_id>", "cancel"] if mode in ("replan", "multi_create_conflict") else None,
     )
 
     if action in (None, ""):
@@ -2287,6 +2464,21 @@ def handle_pending_resolution(
             requires_user_input=True,
             pending_intent_id=pending_intent_id,
             conflict_info=conflict_prompt,
+        )
+
+    if mode == "multi_create_conflict":
+        drafts = pending_state.get("drafts") or []
+        draft_index = int(pending_state.get("draft_index") or 0)
+        if 0 <= draft_index < len(drafts):
+            drafts[draft_index] = draft
+        return _finalize_multi_create(
+            db=db,
+            thread_key=thread_key,
+            thread_state=thread_state,
+            effective_thread_date=effective_thread_date,
+            chat_thread_id=chat_thread_id,
+            message=message,
+            drafts=drafts,
         )
 
     if mode == "unscheduled_conflict" and target_task_id:
@@ -2697,6 +2889,217 @@ def _build_unscheduled_conflict_prompt(
         conflicts=conflicts,
         suggestions=[],
         actions=["choose_task:<task_id>", "cancel"],
+    )
+
+
+def _build_multi_create_prompt(
+    db: Session,
+    thread_key: str,
+    thread_state: dict,
+    effective_thread_date: date,
+    chat_thread_id: str | None,
+    message: str,
+    drafts: list[dict],
+    pending_index: int,
+    awaiting_free_time: bool = False,
+) -> ChatResponse:
+    if pending_index >= len(drafts):
+        pending_index = len(drafts) - 1 if drafts else 0
+    draft = drafts[pending_index]
+    task_title = draft.get("title") or "this task"
+    question = f"What time should I schedule {task_title}?"
+    options_raw = []
+    min_start = None
+    if draft.get("min_start_time"):
+        try:
+            min_start = parse_time(draft["min_start_time"])
+        except Exception:
+            min_start = None
+    if not awaiting_free_time:
+        suggestions = _suggest_slots_same_day_first(
+            db=db,
+            task_date=datetime.strptime(draft["date"], "%Y-%m-%d").date(),
+            duration_min=int(draft.get("duration_minutes") or 60),
+            task_text=f"{draft.get('title', '')} {draft.get('description', '')}",
+            limit=3,
+        )
+        if min_start:
+            suggestions = [s for s in suggestions if s["start_time"] >= min_start]
+        if not suggestions and min_start:
+            task_date = datetime.strptime(draft["date"], "%Y-%m-%d").date()
+            cur = datetime.combine(task_date, min_start)
+            end_dt = datetime.combine(task_date, time(21, 0))
+            while len(suggestions) < 3 and cur + timedelta(minutes=int(draft.get("duration_minutes") or 60)) <= end_dt:
+                suggestions.append(
+                    {
+                        "slot_id": f"{task_date.isoformat()}@{cur.time().strftime('%H:%M:%S')}",
+                        "date": task_date,
+                        "start_time": cur.time(),
+                        "end_time": (cur + timedelta(minutes=int(draft.get('duration_minutes') or 60))).time(),
+                        "score": 0,
+                        "reason": "Suggested based on availability.",
+                    }
+                )
+                cur += timedelta(minutes=15)
+        for s in suggestions:
+            options_raw.append(
+                {
+                    "id": s["slot_id"],
+                    "label": s["start_time"].strftime("%I:%M %p").lstrip("0"),
+                    "value": s["start_time"].strftime("%H:%M"),
+                }
+            )
+        options_raw.append({"id": "other-time", "label": "Other time", "value": "other_time"})
+    pending_intent_id = _save_ask_user_pending_state(
+        db=db,
+        thread_key=thread_key,
+        thread_state=thread_state,
+        effective_thread_date=effective_thread_date,
+        chat_thread_id=chat_thread_id,
+        message=message,
+        field="start_time",
+        question=question,
+        options_raw=options_raw,
+        extra_pending_state={
+            "mode": "multi_create",
+            "drafts": drafts,
+            "pending_index": pending_index,
+            "awaiting_free_time": awaiting_free_time,
+        },
+    )
+    return _build_ask_user_response(thread_key, pending_intent_id, "start_time", question, options_raw)
+
+
+def _finalize_multi_create(
+    db: Session,
+    thread_key: str,
+    thread_state: dict,
+    effective_thread_date: date,
+    chat_thread_id: str | None,
+    message: str,
+    drafts: list[dict],
+) -> ChatResponse:
+    # Check for conflicts before creating any tasks.
+    for idx, draft in enumerate(drafts):
+        conflicts, suggestions = detect_conflicts_for_draft(db, {
+            "title": draft.get("title"),
+            "description": draft.get("description"),
+            "date": datetime.strptime(draft["date"], "%Y-%m-%d").date(),
+            "start_time": parse_time(draft["start_time"]) if draft.get("start_time") else None,
+            "end_time": parse_time(draft["end_time"]) if draft.get("end_time") else None,
+            "duration_minutes": int(draft.get("duration_minutes") or 60),
+            "priority": int(draft.get("priority") or 1),
+        })
+        if conflicts:
+            pending_intent_id = str(uuid.uuid4())
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "conflict",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                    "pending_intent_id": pending_intent_id,
+                    "pending_state_type": "conflict_resolution",
+                    "pending_state": {
+                        "mode": "multi_create_conflict",
+                        "drafts": drafts,
+                        "draft_index": idx,
+                        "pending_index": idx,
+                        "draft": {
+                            "title": draft.get("title"),
+                            "description": draft.get("description"),
+                            "date": draft.get("date"),
+                            "start_time": draft.get("start_time"),
+                            "end_time": draft.get("end_time"),
+                            "duration_minutes": int(draft.get("duration_minutes") or 60),
+                            "priority": int(draft.get("priority") or 1),
+                        },
+                        "conflict_ids": [t.id for t in conflicts],
+                        "suggestions": [
+                            {
+                                "slot_id": s["slot_id"],
+                                "date": s["date"].isoformat(),
+                                "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                "score": float(s["score"]),
+                                "reason": s["reason"],
+                            }
+                            for s in suggestions
+                        ],
+                    },
+                },
+            )
+            return _build_response(
+                mode="conflict",
+                message="That time conflicts with an existing task. Choose a different slot.",
+                resolved_thread_key=thread_key,
+                requires_user_input=True,
+                pending_intent_id=pending_intent_id,
+                conflict_info=_build_conflict_prompt(
+                    intent_id=pending_intent_id,
+                    draft={
+                        "title": draft.get("title"),
+                        "description": draft.get("description"),
+                        "date": datetime.strptime(draft["date"], "%Y-%m-%d").date(),
+                        "start_time": parse_time(draft["start_time"]) if draft.get("start_time") else None,
+                        "end_time": parse_time(draft["end_time"]) if draft.get("end_time") else None,
+                        "duration_minutes": int(draft.get("duration_minutes") or 60),
+                        "priority": int(draft.get("priority") or 1),
+                    },
+                    conflicts=conflicts,
+                    suggestions=suggestions,
+                    actions=["choose_slot:<slot_id>", "cancel"],
+                ),
+            )
+
+    created = []
+    affected_dates = set()
+    for draft in drafts:
+        task_date = datetime.strptime(draft["date"], "%Y-%m-%d").date()
+        start_t = parse_time(draft["start_time"]) if draft.get("start_time") else None
+        end_t = parse_time(draft["end_time"]) if draft.get("end_time") else None
+        created.append(
+            create_task(
+                db=db,
+                title=draft.get("title") or "Task",
+                description=draft.get("description") or "",
+                date=task_date,
+                start_time=start_t,
+                end_time=end_t,
+                priority=int(draft.get("priority") or 1),
+                duration_minutes=int(draft.get("duration_minutes") or 60),
+            )
+        )
+        affected_dates.add(task_date)
+
+    created_ids = [t.id for t in created][:10]
+    save_thread_state(
+        db,
+        thread_key,
+        {
+            "thread_date": effective_thread_date,
+            "chat_thread_id": chat_thread_id,
+            "last_intent_type": "create",
+            "last_user_message": message,
+            "last_created_task_ids": created_ids,
+            "last_updated_task_ids": [],
+            "last_referenced_task_ids": created_ids,
+            "pending_intent_id": None,
+            "pending_state_type": None,
+            "pending_state": {},
+        },
+    )
+    return _build_response(
+        mode="create",
+        message="Created and scheduled tasks.",
+        created_tasks=created,
+        resolved_thread_key=thread_key,
+        affected_dates=affected_dates,
     )
 
 def _normalize_args_list(decision: Any, message: str) -> tuple[list[dict], bool]:
@@ -3442,6 +3845,49 @@ def process_chat_request(
             resolved_thread_key=thread_key,
             warnings=["No task details found in the request."],
         )
+
+    if decision.action == "create_task" and len(args_list) > 1:
+        drafts: list[dict] = []
+        first_missing_index = None
+        ordered_mode = bool(re.search(r"\b(then|followed by|after that|after this|after)\b", (message or "").lower()))
+        last_end_time = None
+        for idx, args in enumerate(args_list):
+            draft = _normalize_task_draft(args=args or {}, message=message, effective_date=effective_thread_date, db=db)
+            start_time_val = draft.get("start_time")
+            end_time_val = draft.get("end_time")
+            explicit_time = bool(args.get("start_time") or start_time_val)
+            if start_time_val and not end_time_val:
+                end_time_val = (datetime.combine(draft.get("date"), start_time_val) + timedelta(minutes=int(draft.get("duration_minutes") or 60))).time()
+            min_start_time = None
+            if ordered_mode and last_end_time and not explicit_time:
+                min_start_time = last_end_time
+            draft_payload = {
+                "title": draft.get("title"),
+                "description": draft.get("description"),
+                "date": draft.get("date").isoformat() if draft.get("date") else effective_thread_date.isoformat(),
+                "start_time": start_time_val.strftime("%H:%M:%S") if start_time_val else None,
+                "end_time": end_time_val.strftime("%H:%M:%S") if end_time_val else None,
+                "duration_minutes": int(draft.get("duration_minutes") or 60),
+                "priority": int(draft.get("priority") or 1),
+                "explicit_time": explicit_time,
+                "min_start_time": min_start_time.strftime("%H:%M:%S") if min_start_time else None,
+            }
+            drafts.append(draft_payload)
+            if not explicit_time and first_missing_index is None:
+                first_missing_index = idx
+            if end_time_val:
+                last_end_time = end_time_val
+        if first_missing_index is not None:
+            return _build_multi_create_prompt(
+                db=db,
+                thread_key=thread_key,
+                thread_state=thread_state,
+                effective_thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                message=message,
+                drafts=drafts,
+                pending_index=first_missing_index,
+            )
 
     interactive_response, created_tasks, affected_dates, pinned_task_ids_by_date, before_state_by_date, latest_end_by_task_id_by_date, intended_times_by_task_id = _execute_create_args(
         message=message,
