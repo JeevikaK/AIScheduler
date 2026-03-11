@@ -6,7 +6,7 @@ from datetime import date, datetime
 from sqlalchemy.orm import Session
 from app.db import get_db
 from app.schemas import ChatInput, ChatResponse, DailyScheduleResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
-from services.tools import create_mood, create_reflection, create_task, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, reflect_on_task, delete_task, reschedule_overdue_tasks, get_summary
+from services.tools import create_mood, create_reflection, create_task, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, reflect_on_task, delete_task, clear_today_tasks, reschedule_overdue_tasks, get_summary
 from services.chat_helpers import (
     process_chat_request,
 )
@@ -113,6 +113,11 @@ def reflect_on_task_endpoint(
 @app.delete("/tasks/{task_id}")
 def delete_task_endpoint(task_id: int, db: Session = Depends(get_db)):
     return delete_task(task_id, db)
+
+
+@app.delete("/tasks/clear/today")
+def clear_today_tasks_endpoint(db: Session = Depends(get_db)):
+    return clear_today_tasks(db)
 
 @app.post("/reschedule/overdue")
 def reschedule_overdue_tasks_endpoint(db: Session = Depends(get_db)):

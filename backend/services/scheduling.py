@@ -59,8 +59,8 @@ def optimize_day_schedule(
             end_dt = datetime.combine(task_date, t.end_time)
             duration = int((end_dt - start_dt).total_seconds() / 60)
         else:
-            # fallback: use duration_min or 60 for existing tasks
-            duration = getattr(t, "duration_min", 60)
+            # fallback: use known duration_minutes or input duration for the new task
+            duration = int(getattr(t, "duration_minutes", 0) or duration_min or 60)
         task_list.append({
             "task": t,
             "duration": duration,
@@ -68,8 +68,8 @@ def optimize_day_schedule(
             "priority": getattr(t, "priority", 1)
         })
 
-    # Sort by priority (desc) and fixed time first
-    task_list.sort(key=lambda x: (x["fixed"], -x["priority"]))
+    # Fixed tasks should be respected first, then higher priority.
+    task_list.sort(key=lambda x: (not x["fixed"], -x["priority"]))
     
     # Assign slots sequentially
     current_dt = datetime.combine(task_date, WORK_START)
@@ -157,6 +157,8 @@ def has_conflict(start, end, existing_tasks):
         if not task.start_time or not task.end_time:
             continue
 
+        if end == task.start_time or start == task.end_time:
+            continue
         if start < task.end_time and end > task.start_time:
             return True
     return False

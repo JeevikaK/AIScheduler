@@ -169,7 +169,7 @@ def update_duration_model(db: Session, task: Task):
         delta=error
     )
 
-def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_task_ids=None):
+def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_task_ids=None, latest_end_by_task_id=None):
     """
     Rebalance tasks for a day.
 
@@ -196,6 +196,17 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
     if not tasks:
         return
 
+    now_dt = datetime.now()
+    day_start_dt = datetime.combine(task_date, work_start)
+    day_end_dt = datetime.combine(task_date, work_end)
+    earliest_start_dt = day_start_dt
+    if task_date == now_dt.date():
+        aligned_now = now_dt.replace(second=0, microsecond=0)
+        rem = aligned_now.minute % buffer_min
+        if rem:
+            aligned_now += timedelta(minutes=(buffer_min - rem))
+        earliest_start_dt = max(day_start_dt, aligned_now)
+
     def is_hard_commitment(task: Task) -> bool:
         """
         Hard commitments should not be moved during rebalance.
@@ -219,6 +230,12 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
             "exam",
             "quiz",
             "test",
+            "breakfast",
+            "lunch",
+            "dinner",
+            "sleep",
+            "bedtime",
+            "go to bed",
         ]
         return any(k in text for k in hard_keywords)
 
@@ -264,6 +281,8 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
     occupied = []
 
     # Keep pinned tasks where they are and reserve their slots.
+    latest_pinned_end = day_end_dt
+    pinned_rows = []
     for task in tasks:
         if task.id not in pinned_ids:
             continue
@@ -281,57 +300,45 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
             end_dt = start_dt + timedelta(minutes=duration_minutes(task))
             task.end_time = end_dt.time()
 
-        occupied.append((start_dt, end_dt, task.id))
+        pinned_rows.append((start_dt, end_dt, task))
+        if end_dt > latest_pinned_end:
+            latest_pinned_end = end_dt
 
+    # Normalize pinned overlaps by shifting only non-hard pinned tasks forward.
+    pinned_rows.sort(key=lambda x: x[0])
+    normalized_pinned = []
+    for start_dt, end_dt, task in pinned_rows:
+        if not normalized_pinned:
+            normalized_pinned.append((start_dt, end_dt, task))
+            continue
+        prev_start, prev_end, _prev_task = normalized_pinned[-1]
+        if start_dt < prev_end:
+            if not is_hard_commitment(task):
+                dur = max(15, int((end_dt - start_dt).total_seconds() // 60))
+                start_dt = prev_end + timedelta(minutes=buffer_min)
+                end_dt = start_dt + timedelta(minutes=dur)
+                task.start_time = start_dt.time()
+                task.end_time = end_dt.time()
+            # If both are hard commitments, preserve original hard slot and accept conflict;
+            # follow-up conflict workflow should handle this explicitly.
+        normalized_pinned.append((start_dt, end_dt, task))
+
+    occupied = [(s, e, t.id) for s, e, t in normalized_pinned]
     occupied.sort(key=lambda x: x[0])
+    # If user pinned a later task (e.g., "till 11pm"), keep scheduling horizon wide enough
+    # so other same-day tasks are not unnecessarily spilled to the next day.
+    latest_normalized_end = max((e for _s, e, _t in normalized_pinned), default=latest_pinned_end)
+    day_end_dt = max(day_end_dt, latest_normalized_end)
 
     movable_tasks = [t for t in tasks if t.id not in pinned_ids]
-
-    # Always account for energy before scheduling slots for the day.
-    if energy <= 2:
-        cursor = datetime.combine(task_date, time(12, 0))
-    else:
-        cursor = datetime.combine(task_date, work_start)
-
     duration_cache = {t.id: duration_minutes(t) for t in movable_tasks}
-    profile_cache = {t.id: task_profile(t) for t in movable_tasks}
-    if energy <= 2:
-        profile_rank = {"recovery": 0, "admin": 1, "physical": 2, "cognitive": 3}
-        movable_tasks.sort(
-            key=lambda t: (
-                -t.priority,
-                profile_rank.get(profile_cache[t.id], 1),
-                duration_cache[t.id],
-                t.id,
-            )
-        )
-    elif energy >= 4:
-        profile_rank = {"cognitive": 0, "physical": 1, "admin": 2, "recovery": 3}
-        movable_tasks.sort(
-            key=lambda t: (
-                -t.priority,
-                profile_rank.get(profile_cache[t.id], 2),
-                -duration_cache[t.id],
-                t.id,
-            )
-        )
-    else:
-        profile_rank = {"cognitive": 0, "admin": 1, "physical": 2, "recovery": 3}
-        movable_tasks.sort(
-            key=lambda t: (
-                -t.priority,
-                profile_rank.get(profile_cache[t.id], 1),
-                -duration_cache[t.id] if profile_cache[t.id] == "cognitive" else duration_cache[t.id],
-                t.id,
-            )
-        )
 
     def find_slot_start(duration: int, initial_start: datetime, day_end: datetime):
         """
         Deterministic slot search across occupied intervals.
         Never loops indefinitely.
         """
-        start = max(initial_start, datetime.combine(task_date, work_start))
+        start = max(initial_start, earliest_start_dt)
 
         for occ_start, occ_end, _ in occupied:
             candidate_end = start + timedelta(minutes=duration)
@@ -348,36 +355,57 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
         # Day is full for this duration.
         return None
 
-    for task in movable_tasks:
-        duration = duration_cache[task.id]
-        day_end = datetime.combine(task_date, work_end)
-        proposed_start = find_slot_start(duration, cursor, day_end)
-        if proposed_start is None:
-            # Spill to next available day/slot instead of forcing overlap on this day.
-            moved = False
-            for offset in range(1, 8):
-                target_date = task_date + timedelta(days=offset)
-                start_time, end_time = optimize_day_schedule(
-                    db=db,
-                    task_date=target_date,
-                    new_task_data={
-                        "title": task.title,
-                        "description": task.description,
-                        "priority": task.priority,
-                    },
-                    duration_min=duration,
-                )
-                if start_time and end_time:
-                    task.date = target_date
-                    task.start_time = start_time
-                    task.end_time = end_time
-                    moved = True
-                    break
+    def has_overlap(start_dt: datetime, end_dt: datetime) -> bool:
+        for occ_start, occ_end, _ in occupied:
+            if start_dt < occ_end and end_dt > occ_start:
+                return True
+        return False
 
-            if not moved:
-                # If no valid slot found in horizon, keep task unscheduled.
-                task.start_time = None
-                task.end_time = None
+    def within_day_window(start_dt: datetime, end_dt: datetime, max_end: datetime | None = None) -> bool:
+        upper = min(day_end_dt, max_end) if max_end else day_end_dt
+        return start_dt >= earliest_start_dt and end_dt <= upper and end_dt > start_dt
+
+    # Preserve already-valid flexible slots first; don't compact to fill empty time.
+    timed_movable = [t for t in movable_tasks if t.start_time and t.end_time]
+    untimed_movable = [t for t in movable_tasks if not (t.start_time and t.end_time)]
+    timed_movable.sort(key=lambda t: (t.start_time, -t.priority, t.id))
+    untimed_movable.sort(key=lambda t: (-t.priority, t.id))
+
+    tasks_to_place = []
+    for task in timed_movable:
+        duration = duration_cache[task.id]
+        start_dt = datetime.combine(task_date, task.start_time)
+        end_dt = datetime.combine(task_date, task.end_time)
+        if end_dt <= start_dt:
+            end_dt = start_dt + timedelta(minutes=duration)
+        max_end = latest_end_by_task_id.get(task.id) if latest_end_by_task_id else None
+        if within_day_window(start_dt, end_dt, max_end=max_end) and not has_overlap(start_dt, end_dt):
+            occupied.append((start_dt, end_dt, task.id))
+            occupied.sort(key=lambda x: x[0])
+            continue
+        tasks_to_place.append(task)
+    tasks_to_place.extend(untimed_movable)
+
+    for task in tasks_to_place:
+        duration = duration_cache[task.id]
+        day_end = day_end_dt
+        if latest_end_by_task_id and task.id in latest_end_by_task_id:
+            day_end = min(day_end_dt, latest_end_by_task_id[task.id])
+        if task.start_time:
+            preferred_start = datetime.combine(task_date, task.start_time)
+        else:
+            preferred_start = earliest_start_dt
+            profile = task_profile(task)
+            if profile == "cognitive" and energy >= 4:
+                preferred_start = max(preferred_start, datetime.combine(task_date, time(9, 0)))
+            elif profile == "recovery" and energy <= 2:
+                preferred_start = max(preferred_start, datetime.combine(task_date, time(12, 0)))
+
+        proposed_start = find_slot_start(duration, preferred_start, day_end)
+        if proposed_start is None:
+            # No valid slot on this day; keep unscheduled instead of spilling automatically.
+            task.start_time = None
+            task.end_time = None
             continue
 
         proposed_end = proposed_start + timedelta(minutes=duration)
@@ -387,6 +415,5 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
 
         occupied.append((proposed_start, proposed_end, task.id))
         occupied.sort(key=lambda x: x[0])
-        cursor = proposed_end + timedelta(minutes=break_after(task, duration))
 
     db.commit()

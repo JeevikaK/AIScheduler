@@ -26,6 +26,227 @@ STOP_WORDS = {
     "move", "moved", "earlier", "later", "before", "after", "around", "about",
 }
 
+FOLLOWUP_VERBS = ("move", "change", "shift", "reschedul", "push", "postpone", "swap", "keep", "remove", "delete", "drop", "cancel")
+
+
+def _looks_like_replan_mutation_request(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    has_mutation = bool(
+        re.search(
+            r"\b(move|change|shift|reschedul|push|postpone|swap|keep|remove|delete|drop|cancel)\b",
+            lower,
+        )
+    )
+    if not has_mutation:
+        return False
+    has_existing_ref = bool(
+        re.search(r"\b(this|that|it|these|those|other tasks?|existing tasks?|task-\d+)\b", lower)
+    )
+    # "move X to Y" / "change X to Y" generally implies replan.
+    has_direct_transform = bool(re.search(r"\b(move|change|shift|reschedul)\b.*\bto\b", lower))
+    has_implicit_adjustment = bool(
+        re.search(r"\b(make|do|apply)\s+(the\s+)?change\b", lower)
+        or re.search(r"\b(adjust|update|modify)\b.*\b(accordingly|as discussed|as above)\b", lower)
+        or "accordingly" in lower
+    )
+    return has_existing_ref or has_direct_transform or has_implicit_adjustment
+
+
+def _looks_like_followup_instruction(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    if _looks_like_replan_mutation_request(lower):
+        return True
+    if re.search(r"\b(make|apply)\s+(the\s+)?change\b", lower):
+        return True
+    if re.search(r"\b(change|adjust|update|modify)\b.*\b(accordingly|as discussed|as above)\b", lower):
+        return True
+    if "on second thought" in lower or lower.startswith("no change"):
+        return True
+    return False
+
+
+def _has_thread_task_context(thread_state: dict | None) -> bool:
+    if not thread_state:
+        return False
+    return bool(
+        thread_state.get("last_referenced_task_ids")
+        or thread_state.get("last_created_task_ids")
+        or thread_state.get("last_updated_task_ids")
+    )
+
+
+def _looks_like_fresh_plan_request(text: str, fallback_multi: list[dict]) -> bool:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    if _looks_like_followup_instruction(lower):
+        return False
+
+    has_planning_phrase = any(
+        p in lower
+        for p in [
+            "plan my day",
+            "block my calendar",
+            "fit in",
+            "i have",
+            "i need",
+            "i want",
+            "i'll",
+            "i will",
+        ]
+    )
+    has_time_span = bool(
+        re.search(
+            r"\bfrom\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:to|-)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b",
+            lower,
+        )
+    )
+    return len(fallback_multi) >= 2 and (has_planning_phrase or has_time_span)
+
+
+def _looks_like_schedule_request(text: str) -> bool:
+    lower = (text or "").lower()
+    if not lower.strip():
+        return False
+    return bool(
+        re.search(
+            r"\b(schedule|calendar|plan for today|show (?:my|the) plan|what(?:'s| is) (?:my|the) schedule)\b",
+            lower,
+        )
+    )
+
+
+def _infer_fallback_action(message: str, thread_state: dict | None) -> str | None:
+    text = message or ""
+    fallback_multi = split_tasks_from_message(text)
+    if _looks_like_schedule_request(text):
+        return "get_schedule"
+    if _looks_like_followup_instruction(text) and _has_thread_task_context(thread_state):
+        return "replan_day"
+    if _looks_like_fresh_plan_request(text, fallback_multi) or len(fallback_multi) >= 2:
+        return "create_task"
+    return None
+
+
+def _infer_replan_summary(message: str) -> tuple[str | None, str | None]:
+    """
+    Try to extract a target phrase and time for replan confirmation prompts.
+    Returns (target_phrase, time_str).
+    """
+    text = (message or "").strip()
+    lower = text.lower()
+    if not text:
+        return None, None
+    m = re.search(
+        r"\b(?:move|change|shift|reschedul|update|adjust)\b\s+(?:the\s+)?(.+?)\s+(?:to|till|until|by)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        lower,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    # Fallback: detect a time mention without a clear target phrase.
+    time_match = re.search(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", lower)
+    return None, time_match.group(1).strip() if time_match else None
+
+
+def _parse_replan_request(message: str) -> dict:
+    text = (message or "").strip()
+    lower = text.lower()
+    if not text:
+        return {
+            "target_phrase": None,
+            "requested_start_time": None,
+            "requested_end_time": None,
+            "requested_date": None,
+            "direction": None,
+            "time_str": None,
+        }
+
+    requested_date = extract_date_from_text(text) if _has_explicit_date_cue(text) else None
+    direction = None
+    if any(k in lower for k in ["earlier", "before", "ahead"]):
+        direction = "earlier"
+    elif any(k in lower for k in ["later", "after", "postpone", "push"]):
+        direction = "later"
+
+    target_phrase = None
+    target_match = re.search(
+        r"\b(?:move|change|shift|reschedul|update|adjust|set)\b\s+(?:the\s+)?(.+?)\s+(?:to|till|until|by|from)\b",
+        lower,
+        flags=re.IGNORECASE,
+    )
+    if target_match:
+        target_phrase = target_match.group(1).strip()
+
+    end_match = re.search(
+        r"\b(.+?)\s+(?:end|ends|ending|finish|finishes)\s+(?:at|by)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        lower,
+        flags=re.IGNORECASE,
+    )
+    if end_match and not target_phrase:
+        target_phrase = end_match.group(1).strip()
+    if end_match:
+        requested_end = _parse_clock_token(end_match.group(2))
+
+    end_direct = re.search(
+        r"\bend\s+(?:the\s+)?(.+?)\s+(?:at|by)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        lower,
+        flags=re.IGNORECASE,
+    )
+    if end_direct:
+        target_phrase = end_direct.group(1).strip()
+        requested_end = _parse_clock_token(end_direct.group(2))
+
+    range_start, range_end = _extract_time_range(lower)
+    requested_start = None
+    requested_end = None
+    if range_start and range_end and re.search(r"\b(move|change|shift|reschedul|update|adjust|set)\b", lower):
+        requested_start = range_start
+        requested_end = range_end
+
+    explicit_end_time = None
+    if not requested_end:
+        end_time_match = re.search(
+            r"\b(?:till|until|end|ends?|ending|finish|finishes)\b.*?\b(?:at|by|to)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+            lower,
+            flags=re.IGNORECASE,
+        )
+        if end_time_match:
+            explicit_end_time = _parse_clock_token(end_time_match.group(1))
+            requested_end = explicit_end_time
+
+    if not requested_start and not requested_end:
+        change_match = re.search(
+            r"\b(?:to|at)\b\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+            lower,
+            flags=re.IGNORECASE,
+        )
+        if change_match:
+            prefer_pm = any(k in lower for k in ["dinner", "party", "event", "meeting", "class", "evening", "night"])
+            requested_start = _parse_clock_token(
+                f"{change_match.group(1)}:{change_match.group(2) or '00'}{change_match.group(3) or ''}",
+                prefer_pm=prefer_pm,
+            )
+
+    time_str = None
+    if requested_end and not requested_start:
+        time_str = requested_end.strftime("%I:%M %p").lstrip("0")
+    elif requested_start:
+        time_str = requested_start.strftime("%I:%M %p").lstrip("0")
+
+    return {
+        "target_phrase": target_phrase,
+        "requested_start_time": requested_start,
+        "requested_end_time": requested_end,
+        "requested_date": requested_date,
+        "direction": direction,
+        "time_str": time_str,
+    }
+
 def _parse_ids(raw: str | None) -> list[int]:
     if not raw:
         return []
@@ -62,6 +283,12 @@ def _dump_json_obj(obj: dict | None) -> str | None:
     if not obj:
         return None
     return json.dumps(obj)
+
+
+def _time_to_str(value: time | None) -> str | None:
+    if isinstance(value, time):
+        return value.strftime("%H:%M:%S")
+    return None
 
 
 def resolve_thread_key(chat_thread_id: str | None, thread_date: date) -> str:
@@ -248,12 +475,27 @@ def split_tasks_from_message(message: str):
     if not message or not message.strip():
         return []
 
+    def _is_actionable_clause(text: str) -> bool:
+        if not text:
+            return False
+        lower = text.lower()
+        # Explicit time/duration cues imply an actionable task.
+        if _extract_time_range(lower)[0] or extract_time_from_text(lower):
+            return True
+        if re.search(r"\b\d+\s*(hour|hours|hr|hrs|min|mins|minute|minutes)\b", lower):
+            return True
+        # Simple verb heuristics for tasks.
+        if re.search(r"\b(go|eat|cook|study|work|rest|sleep|talk|call|meet|attend|exercise|walk|code|coding|practice|read|write|buy|shop|clean|do)\b", lower):
+            return True
+        return False
+
     parts = re.split(
         r"(?:\n|;|,|\band then\b|\bthen\b|\bplus\b|\balso\b|\s+and\s+)",
         message,
         flags=re.IGNORECASE,
     )
     candidates = [p.strip(" .\t") for p in parts if p and p.strip(" .\t")]
+    candidates = [c for c in candidates if _is_actionable_clause(c)]
 
     if len(candidates) < 2:
         return []
@@ -314,7 +556,29 @@ def extract_time_from_text(text: str):
 
     hhmm = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
     if hhmm:
-        return time(int(hhmm.group(1)), int(hhmm.group(2)))
+        hour = int(hhmm.group(1))
+        minute = int(hhmm.group(2))
+        # Ambiguous HH:MM without meridian: prefer PM for common evening/night cues.
+        if 1 <= hour <= 7:
+            prefer_pm = any(
+                cue in lower
+                for cue in [
+                    "evening",
+                    "night",
+                    "rest of the night",
+                    "after class",
+                    "after work",
+                    "after",
+                    "party",
+                    "dinner",
+                    "class",
+                ]
+            )
+            if "morning" in lower:
+                prefer_pm = False
+            if prefer_pm:
+                hour += 12
+        return time(hour, minute)
 
     # Bare-hour phrases like "at 7" or "by 9".
     bare = re.search(r"\b(?:at|by|around)\s+(\d{1,2})\b", lower)
@@ -398,11 +662,24 @@ def _is_hard_commitment(task: Task) -> bool:
         "quiz",
         "test",
         "mandatory",
+        "breakfast",
+        "lunch",
+        "dinner",
+        "sleep",
+        "bedtime",
+        "go to bed",
     ]
     return any(k in text for k in hard_keywords)
 
 
+def _is_event_like(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in ["quiz", "exam", "test", "class", "meeting", "interview", "presentation"])
+
+
 def _slot_overlaps(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:
+    if end_a == start_b or end_b == start_a:
+        return False
     return start_a < end_b and end_a > start_b
 
 
@@ -532,6 +809,54 @@ def suggest_alternative_slots(
     return suggestions[:limit]
 
 
+def _suggest_slots_same_day_first(
+    db: Session,
+    task_date: date | None,
+    duration_min: int,
+    task_text: str,
+    limit: int = 3,
+    lookahead_days: int = 7,
+) -> list[dict]:
+    if not task_date or limit <= 0:
+        return []
+
+    suggestions = suggest_alternative_slots(
+        db=db,
+        task_date=task_date,
+        duration_min=duration_min,
+        task_text=task_text,
+        limit=limit,
+    )
+    if len(suggestions) >= limit:
+        return suggestions[:limit]
+
+    remaining = limit - len(suggestions)
+    today = date.today()
+    if task_date >= today:
+        base_day = task_date
+        start_offset = 1
+    else:
+        base_day = today
+        start_offset = 0
+
+    for offset in range(start_offset, start_offset + lookahead_days):
+        if remaining <= 0:
+            break
+        day = base_day + timedelta(days=offset)
+        day_suggestions = suggest_alternative_slots(
+            db=db,
+            task_date=day,
+            duration_min=duration_min,
+            task_text=task_text,
+            limit=remaining,
+        )
+        if day_suggestions:
+            suggestions.extend(day_suggestions)
+            remaining = limit - len(suggestions)
+
+    return suggestions[:limit]
+
+
 def detect_conflicts_for_draft(db: Session, draft: dict) -> tuple[list[Task], list[dict]]:
     task_date = draft.get("date")
     start_t = draft.get("start_time")
@@ -566,7 +891,13 @@ def detect_conflicts_for_draft(db: Session, draft: dict) -> tuple[list[Task], li
     return conflicts, suggestions
 
 
-def _build_clarification_prompt(intent_id: str, field: str, question: str, options: list[dict] | None = None) -> ClarificationPrompt:
+def _build_clarification_prompt(
+    intent_id: str,
+    field: str,
+    question: str,
+    options: list[dict] | None = None,
+    allow_free_text: bool = True,
+) -> ClarificationPrompt:
     prompt_options = []
     for idx, item in enumerate(options or []):
         prompt_options.append(
@@ -581,7 +912,7 @@ def _build_clarification_prompt(intent_id: str, field: str, question: str, optio
         question=question,
         field=field,
         options=prompt_options,
-        allow_free_text=True,
+        allow_free_text=allow_free_text,
     )
 
 
@@ -638,12 +969,20 @@ def handle_followup_replan(
     thread_state: dict | None = None,
     reference_date: date | None = None,
     return_metadata: bool = False,
+    dry_run: bool = False,
 ):
     today = reference_date or date.today()
     text = (message or "").lower()
     if not text.strip():
         return ([], {"memory_used": False, "referenced_task_ids": []}) if return_metadata else []
-    requested_time = extract_time_from_text(message)
+    parsed = _parse_replan_request(message)
+    requested_start = parsed.get("requested_start_time")
+    requested_end = parsed.get("requested_end_time")
+    requested_date = parsed.get("requested_date") or today
+    target_phrase = parsed.get("target_phrase")
+    direction = parsed.get("direction")
+    time_str = parsed.get("time_str")
+    has_explicit_date_in_message = _has_explicit_date_cue(message)
 
     memory_order = []
     if thread_state:
@@ -688,7 +1027,18 @@ def handle_followup_replan(
     if not candidate_tasks:
         return ([], {"memory_used": False, "referenced_task_ids": []}) if return_metadata else []
 
-    meta = {"memory_used": False, "referenced_task_ids": []}
+    meta = {
+        "memory_used": False,
+        "referenced_task_ids": [],
+        "needs_clarification": False,
+        "candidate_task_ids": [],
+        "target_phrase": target_phrase,
+        "time_str": time_str,
+        "requested_start_time": requested_start,
+        "requested_end_time": requested_end,
+        "requested_date": requested_date,
+        "ready_to_apply": False,
+    }
 
     def _tokenize(s: str) -> set[str]:
         tokens = set()
@@ -705,6 +1055,9 @@ def handle_followup_replan(
 
     def _task_tokens(task: Task) -> set[str]:
         return _tokenize(f"{task.title or ''} {task.description or ''}")
+
+    def _title_tokens(task: Task) -> set[str]:
+        return _tokenize(task.title or "")
 
     def _score_task(task: Task, query_tokens: set[str]) -> float:
         if not query_tokens:
@@ -726,6 +1079,31 @@ def handle_followup_replan(
             s = _score_task(t, query_tokens)
             if s > 0:
                 scored.append((s, t))
+        if not scored:
+            return None
+        scored.sort(
+            key=lambda x: (
+                -x[0],
+                x[1].date,
+                x[1].start_time or time(23, 59),
+                -x[1].priority,
+                x[1].id,
+            )
+        )
+        return scored[0][1]
+
+    def _pick_best_task_for_explicit_target(tasks: List[Task], query_tokens: set[str]):
+        if not query_tokens:
+            return None
+        scored = []
+        for t in tasks:
+            title_overlap = len(query_tokens.intersection(_title_tokens(t)))
+            all_overlap = len(query_tokens.intersection(_task_tokens(t)))
+            if title_overlap == 0 and all_overlap == 0:
+                continue
+            # Prefer title matches strongly over description-only overlaps.
+            score = float(title_overlap * 4 + all_overlap)
+            scored.append((score, t))
         if not scored:
             return None
         scored.sort(
@@ -779,137 +1157,103 @@ def handle_followup_replan(
             return time(hour, minute)
         return None
 
-    all_tokens = _tokenize(text)
-    anchor = _pick_best_task(candidate_tasks, all_tokens) if all_tokens else None
-    pronoun_ref = bool(re.search(r"\b(it|that|this|one)\b", text))
+    explicit_target_tokens = _tokenize(target_phrase) if target_phrase else set()
+    message_tokens = _tokenize(text)
+
+    def _substring_match(tasks: List[Task], phrase: str | None):
+        if not phrase:
+            return None, []
+        phrase_l = phrase.lower().strip()
+        if not phrase_l:
+            return None, []
+        matches = []
+        for t in tasks:
+            title_l = (t.title or "").lower()
+            if not title_l:
+                continue
+            if phrase_l in title_l or title_l in text:
+                matches.append(t)
+        if len(matches) == 1:
+            return matches[0], matches
+        return None, matches
+
+    def _best_match(tasks: List[Task], tokens: set[str]) -> tuple[Task | None, list[Task]]:
+        if not tokens:
+            return None, []
+        scored = []
+        for t in tasks:
+            title_overlap = len(tokens.intersection(_title_tokens(t)))
+            all_overlap = len(tokens.intersection(_task_tokens(t)))
+            if title_overlap == 0 and all_overlap == 0:
+                continue
+            score = float(title_overlap * 4 + all_overlap)
+            scored.append((score, t))
+        if not scored:
+            return None, []
+        scored.sort(key=lambda x: (-x[0], x[1].date, x[1].start_time or time(23, 59), x[1].id))
+        best_score = scored[0][0]
+        best = [t for s, t in scored if s == best_score]
+        if len(best) == 1:
+            return best[0], best
+        return None, best
+
+    anchor = None
+    ambiguous_candidates = []
+    if target_phrase:
+        anchor, ambiguous_candidates = _substring_match(candidate_tasks, target_phrase)
+        if not anchor and not ambiguous_candidates and explicit_target_tokens:
+            anchor, ambiguous_candidates = _best_match(candidate_tasks, explicit_target_tokens)
+    elif message_tokens:
+        # Fallback: see if any title tokens appear verbatim in the message.
+        anchor, ambiguous_candidates = _best_match(candidate_tasks, message_tokens)
 
     if not anchor and thread_state:
         id_to_task = {t.id: t for t in candidate_tasks}
-        # Prefer same-day references first, then any-date fallback.
-        same_day_candidates = []
-        any_day_candidates = []
         for tid in memory_order:
             candidate = id_to_task.get(tid)
-            if not candidate:
-                continue
-            if candidate.date == today:
-                same_day_candidates.append(candidate)
-            else:
-                any_day_candidates.append(candidate)
-        if same_day_candidates:
-            anchor = same_day_candidates[0]
-            meta["memory_used"] = True
-        elif any_day_candidates:
-            anchor = any_day_candidates[0]
-            meta["memory_used"] = True
+            if candidate:
+                anchor = candidate
+                meta["memory_used"] = True
+                break
 
-    if not anchor and all_tokens:
-        anchor = _pick_best_task(candidate_tasks, all_tokens)
+    if not anchor and requested_start:
+        candidates = [
+            t for t in candidate_tasks
+            if t.start_time and t.start_time == requested_start and t.date == requested_date
+        ]
+        if len(candidates) == 1:
+            anchor = candidates[0]
+        elif len(candidates) > 1:
+            ambiguous_candidates = candidates
 
-    if not anchor and pronoun_ref:
-        # Immediate-context fallback: treat pronouns as most recently created/updated task.
+    if not anchor and re.search(r"\b(it|that|this|one)\b", text):
         anchor = max(candidate_tasks, key=lambda t: t.id)
 
-    if not requested_time:
-        requested_time = _extract_change_to_time(message, anchor)
+    if ambiguous_candidates and not anchor:
+        meta["needs_clarification"] = True
+        meta["candidate_task_ids"] = [t.id for t in ambiguous_candidates][:5]
+        return ([], meta) if return_metadata else []
 
     if not anchor:
-        if requested_time:
-            # If only a time is given, use most recent scheduled task as likely referent.
-            scheduled = [t for t in candidate_tasks if t.start_time]
-            anchor = max(scheduled, key=lambda t: t.id) if scheduled else max(candidate_tasks, key=lambda t: t.id)
-        else:
-            return ([], meta) if return_metadata else []
+        meta["needs_clarification"] = True
+        return ([], meta) if return_metadata else []
 
-    direction = None
-    if any(k in text for k in ["earlier", "before", "ahead"]):
-        direction = "earlier"
-    elif any(k in text for k in ["later", "after", "postpone", "push"]):
-        direction = "later"
+    # Safety: for follow-up edits without explicit date, avoid mutating a different day by accident.
+    if anchor and (not has_explicit_date_in_message) and anchor.date != today:
+        meta["needs_clarification"] = True
+        return ([], meta) if return_metadata else []
 
-    move_target_tokens = set()
-    move_match = re.search(
-        r"\bmove\s+(?:the\s+)?(.+?)\s+(earlier|later|before|after)\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if move_match:
-        move_target_tokens = _tokenize(move_match.group(1))
+    if not requested_start and not requested_end:
+        meta["needs_clarification"] = True
+        return ([], meta) if return_metadata else []
 
-    # Support patterns like "move talking to mom from 6 to 7:30"
-    move_from_to_match = re.search(
-        r"\bmove\s+(?:the\s+)?(.+?)\s+from\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+to\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    from_to_from_token = None
-    from_to_to_token = None
-    if move_from_to_match:
-        move_target_tokens = _tokenize(move_from_to_match.group(1))
-        from_to_from_token = move_from_to_match.group(2)
-        from_to_to_token = move_from_to_match.group(3)
+    if direction and not (requested_start or requested_end):
+        meta["needs_clarification"] = True
+        return ([], meta) if return_metadata else []
 
-    def _parse_from_time_variants(raw: str):
-        if not raw:
-            return []
-        m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", raw, flags=re.IGNORECASE)
-        if not m:
-            return []
-        hour = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        meridian = (m.group(3) or "").lower()
-        variants = []
-        if meridian:
-            if meridian == "pm" and hour != 12:
-                hour += 12
-            elif meridian == "am" and hour == 12:
-                hour = 0
-            variants.append(time(hour, minute))
-        else:
-            if 0 <= hour <= 23:
-                variants.append(time(hour, minute))
-            if 1 <= hour <= 11:
-                variants.append(time(hour + 12, minute))
-        # dedupe
-        uniq = []
-        for v in variants:
-            if v not in uniq:
-                uniq.append(v)
-        return uniq
-
-    # If user explicitly says "move <task> ...", force anchor by that phrase first.
-    if move_target_tokens:
-        targeted_anchor = _pick_best_task(candidate_tasks, move_target_tokens)
-        if targeted_anchor:
-            anchor = targeted_anchor
-        elif from_to_from_token:
-            from_variants = _parse_from_time_variants(from_to_from_token)
-            if from_variants:
-                candidates = [
-                    t for t in candidate_tasks
-                    if t.start_time and any((t.start_time.hour == fv.hour and t.start_time.minute == fv.minute) for fv in from_variants)
-                ]
-                if candidates:
-                    # If multiple tasks at same from-time, pick best semantic match.
-                    semantic = _pick_best_task(candidates, move_target_tokens)
-                    anchor = semantic or max(candidates, key=lambda t: t.id)
-    elif from_to_from_token and not anchor:
-        # Fallback for "move ... from A to B" when text tokens are noisy.
-        from_variants = _parse_from_time_variants(from_to_from_token)
-        if from_variants:
-            candidates = [
-                t for t in candidate_tasks
-                if t.start_time and any((t.start_time.hour == fv.hour and t.start_time.minute == fv.minute) for fv in from_variants)
-            ]
-            if candidates:
-                anchor = max(candidates, key=lambda t: t.id)
-
-    # In "move X from A to B", resolve destination time after anchor is known so AM/PM can inherit from anchor.
-    if from_to_to_token:
-        requested_time = _extract_change_to_time(
-            f"change to {from_to_to_token}",
-            anchor,
-        ) or requested_time
+    meta["ready_to_apply"] = True
+    if dry_run:
+        return ([], meta) if return_metadata else []
 
     target_date = anchor.date
     # Snapshot day state so we can return only changed tasks.
@@ -920,81 +1264,76 @@ def handle_followup_replan(
     )
     before_state = {t.id: (t.date, t.start_time, t.end_time) for t in before_day_tasks}
 
-    pinned_ids = set()
+    changed_ids = set()
 
-    # Absolute time update for the anchor task.
-    if requested_time:
-        duration = task_duration_minutes(anchor)
-        anchor.start_time = requested_time
-        anchor.end_time = (
-            datetime.combine(anchor.date, requested_time) + timedelta(minutes=duration)
-        ).time()
-        pinned_ids.add(anchor.id)
-        meta["referenced_task_ids"].append(anchor.id)
-
-    # Relative move request for an explicitly mentioned task phrase.
-    if direction and move_target_tokens:
-        same_day = (
-            db.query(Task)
-            .filter(
-                Task.date == target_date,
-                Task.completed == False,
-                Task.id != anchor.id,
-            )
-            .order_by(Task.priority.desc(), Task.start_time.asc(), Task.id.asc())
-            .all()
-        )
-        related = _pick_best_task(same_day, move_target_tokens)
-        if related:
-            rel_duration = task_duration_minutes(related)
-            buffer_min = 5
-            day_start = datetime.combine(target_date, time(9, 0))
-            day_end = datetime.combine(target_date, time(21, 0))
-
-            anchor_start = anchor.start_time or requested_time or time(12, 0)
-            anchor_end = anchor.end_time or (
-                datetime.combine(target_date, anchor_start) + timedelta(minutes=task_duration_minutes(anchor))
+    duration = task_duration_minutes(anchor)
+    if requested_start and requested_end:
+        anchor.start_time = requested_start
+        anchor.end_time = requested_end
+    elif requested_end and anchor.start_time:
+        candidate_end = requested_end
+        if datetime.combine(anchor.date, candidate_end) <= datetime.combine(anchor.date, anchor.start_time):
+            candidate_end = (
+                datetime.combine(anchor.date, candidate_end) + timedelta(hours=12)
             ).time()
+        if datetime.combine(anchor.date, candidate_end) <= datetime.combine(anchor.date, anchor.start_time):
+            candidate_end = (
+                datetime.combine(anchor.date, anchor.start_time) + timedelta(minutes=15)
+            ).time()
+        anchor.end_time = candidate_end
+    elif requested_start:
+        anchor.start_time = requested_start
+        anchor.end_time = (
+            datetime.combine(anchor.date, requested_start) + timedelta(minutes=duration)
+        ).time()
+    changed_ids.add(anchor.id)
+    meta["referenced_task_ids"].append(anchor.id)
 
-            if direction == "earlier":
-                end_dt = datetime.combine(target_date, anchor_start) - timedelta(minutes=buffer_min)
-                start_dt = end_dt - timedelta(minutes=rel_duration)
-            else:
-                start_dt = datetime.combine(target_date, anchor_end) + timedelta(minutes=buffer_min)
-                end_dt = start_dt + timedelta(minutes=rel_duration)
+    def _dt_range(task: Task):
+        if not task.start_time:
+            return None, None
+        s = datetime.combine(task.date, task.start_time)
+        if task.end_time:
+            e = datetime.combine(task.date, task.end_time)
+        else:
+            e = s + timedelta(minutes=task_duration_minutes(task))
+        if e <= s:
+            e = s + timedelta(minutes=max(15, task_duration_minutes(task)))
+        return s, e
 
-            if start_dt < day_start:
-                start_dt = day_start
-                end_dt = start_dt + timedelta(minutes=rel_duration)
-            if end_dt > day_end:
-                end_dt = day_end
-                start_dt = end_dt - timedelta(minutes=rel_duration)
-                if start_dt < day_start:
-                    start_dt = day_start
+    changed_tasks = [t for t in before_day_tasks if t.id in changed_ids]
+    conflicts = set()
+    for changed_task in changed_tasks:
+        c_start, c_end = _dt_range(changed_task)
+        if not c_start or not c_end:
+            continue
+        for other in before_day_tasks:
+            if other.id == changed_task.id:
+                continue
+            o_start, o_end = _dt_range(other)
+            if not o_start or not o_end:
+                continue
+            if _slot_overlaps(c_start, c_end, o_start, o_end):
+                conflicts.add(other.id)
 
-            related.start_time = start_dt.time()
-            related.end_time = end_dt.time()
-            pinned_ids.add(related.id)
-            meta["referenced_task_ids"].append(related.id)
-
-    # Generic "move earlier/later" without explicit phrase: shift anchor by 30 mins.
-    elif direction and not requested_time and anchor.start_time:
-        shift_min = -30 if direction == "earlier" else 30
-        duration = task_duration_minutes(anchor)
-        day_start = datetime.combine(target_date, time(9, 0))
-        day_end = datetime.combine(target_date, time(21, 0))
-        shifted_start = datetime.combine(target_date, anchor.start_time) + timedelta(minutes=shift_min)
-        shifted_start = max(day_start, min(shifted_start, day_end - timedelta(minutes=duration)))
-        shifted_end = shifted_start + timedelta(minutes=duration)
-        anchor.start_time = shifted_start.time()
-        anchor.end_time = shifted_end.time()
-        pinned_ids.add(anchor.id)
-        meta["referenced_task_ids"].append(anchor.id)
+    if conflicts:
+        proposed_start = anchor.start_time
+        proposed_end = anchor.end_time
+        db.rollback()
+        meta.update(
+            {
+                "conflict_task_id": anchor.id,
+                "conflicting_ids": sorted(list(conflicts)),
+                "proposed_start_time": proposed_start,
+                "proposed_end_time": proposed_end,
+                "duration_minutes": task_duration_minutes(anchor),
+            }
+        )
+        if return_metadata:
+            return [], meta
+        return []
 
     db.commit()
-
-    # Rebalance around pinned tasks.
-    rebalance_day(db, target_date, pinned_task_ids=pinned_ids)
 
     refreshed = (
         db.query(Task)
@@ -1157,8 +1496,9 @@ def _normalize_task_draft(
     if isinstance(end_time_str, str) and end_time_str.strip():
         end_time_val = parse_time(end_time_str.strip())
     if not start_time_val:
+        # Do not use full message for draft-time extraction; it can leak unrelated times.
         start_time_val = extract_time_from_text(
-            f"{args.get('title') or ''} {args.get('description') or ''} {message}"
+            f"{args.get('title') or ''} {args.get('description') or ''}"
         )
 
     deadline_date = None
@@ -1195,7 +1535,13 @@ def _normalize_task_draft(
     }
 
 
-def _build_conflict_prompt(intent_id: str, draft: dict, conflicts: list[Task], suggestions: list[dict]) -> ConflictPrompt:
+def _build_conflict_prompt(
+    intent_id: str,
+    draft: dict,
+    conflicts: list[Task],
+    suggestions: list[dict],
+    actions: list[str] | None = None,
+) -> ConflictPrompt:
     conflict_items = [
         ConflictTaskRef(
             task_id=t.id,
@@ -1232,22 +1578,59 @@ def _build_conflict_prompt(intent_id: str, draft: dict, conflicts: list[Task], s
         new_task_draft=draft_payload,
         conflicting_tasks=conflict_items,
         suggested_slots=suggestion_items,
-        actions=[
+        actions=actions or [
             "choose_slot:<slot_id>",
             "keep_original_and_move_conflicts",
             "cancel",
         ],
     )
 
+def _format_task_choice_label(task: Task) -> str:
+    start = task.start_time.strftime("%H:%M") if task.start_time else "unscheduled"
+    end = task.end_time.strftime("%H:%M") if task.end_time else "unscheduled"
+    return f"{task.title} ({task.date.isoformat()} {start}-{end})"
 
-def _parse_pending_action(message: str, pending_response: dict | None) -> str | None:
+
+def _format_slot_choice_label(slot: dict) -> str:
+    date_str = slot["date"].isoformat() if isinstance(slot.get("date"), date) else str(slot.get("date"))
+    start = slot["start_time"].strftime("%H:%M") if slot.get("start_time") else ""
+    end = slot["end_time"].strftime("%H:%M") if slot.get("end_time") else ""
+    return f"{date_str} {start}-{end}".strip()
+
+
+def _build_choice_map(choices: list[tuple[str, str]]) -> dict[str, str]:
+    return {str(i + 1): action for i, (_label, action) in enumerate(choices)}
+
+
+def _format_choice_message(prefix: str, choices: list[tuple[str, str]]) -> str:
+    lines = [prefix, "Options:"]
+    for i, (label, _action) in enumerate(choices, 1):
+        lines.append(f"{i}. {label}")
+    lines.append("Reply with the option number.")
+    return "\n".join(lines)
+
+
+def _parse_pending_action(message: str, pending_response: dict | None, pending_state: dict | None = None) -> str | None:
     if pending_response and isinstance(pending_response, dict):
         raw_action = pending_response.get("action")
         if isinstance(raw_action, str) and raw_action.strip():
             return raw_action.strip()
+        raw_value = pending_response.get("value")
+        if isinstance(raw_value, str) and raw_value.strip() and pending_state:
+            choice_map = pending_state.get("choice_map") or {}
+            mapped = choice_map.get(raw_value.strip())
+            if mapped:
+                return mapped
     text = (message or "").strip().lower()
     if not text:
         return None
+    if pending_state:
+        choice_map = pending_state.get("choice_map") or {}
+        m = re.search(r"\b(\d+)\b", text)
+        if m:
+            mapped = choice_map.get(m.group(1))
+            if mapped:
+                return mapped
     if text == "cancel":
         return "cancel"
     if "you decide" in text:
@@ -1283,6 +1666,11 @@ def handle_pending_resolution(
             action_from_payload = bool(action_value)
         if not action_value and message:
             action_value = message.strip()
+        if isinstance(action_value, str):
+            choice_map = pending_state.get("choice_map") or {}
+            mapped = choice_map.get(action_value.strip())
+            if mapped:
+                action_value = mapped
         if not action_value:
             prompt = _build_clarification_prompt(
                 intent_id=pending_intent_id,
@@ -1301,6 +1689,253 @@ def handle_pending_resolution(
             )
         draft = pending_state.get("draft") or {}
         field = pending_state.get("field")
+        if pending_state.get("intent") == "replan":
+            if isinstance(action_value, str) and action_value.strip().lower() == "cancel":
+                _clear_pending_state(
+                    db,
+                    thread_key=thread_key,
+                    thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    thread_state=thread_state,
+                    last_intent_type="cancel",
+                    last_user_message=message,
+                )
+                return _build_response(
+                    mode="replan",
+                    message="Okay, canceled the change.",
+                    resolved_thread_key=thread_key,
+                )
+            target_task_id = None
+            if isinstance(action_value, str):
+                m = re.search(r"task[-\s]*([0-9]+)", action_value, flags=re.IGNORECASE)
+                if m:
+                    target_task_id = int(m.group(1))
+                elif action_value.isdigit():
+                    target_task_id = int(action_value)
+            if not target_task_id:
+                candidate_ids = pending_state.get("candidate_task_ids") or []
+                if len(candidate_ids) == 1:
+                    target_task_id = int(candidate_ids[0])
+
+            parsed_reply = _parse_replan_request(action_value if isinstance(action_value, str) else "")
+            requested_start = parsed_reply.get("requested_start_time")
+            requested_end = parsed_reply.get("requested_end_time")
+            if not requested_start and not requested_end:
+                requested_start = _parse_clock_token(str(action_value)) if isinstance(action_value, str) else None
+            if not requested_start and not requested_end and isinstance(action_value, str):
+                try:
+                    requested_start = parse_time(action_value)
+                except Exception:
+                    requested_start = None
+            if not requested_start and not requested_end:
+                req_start_str = pending_state.get("requested_start_time")
+                req_end_str = pending_state.get("requested_end_time")
+                if req_start_str:
+                    requested_start = parse_time(req_start_str)
+                if req_end_str:
+                    requested_end = parse_time(req_end_str)
+
+            if not target_task_id:
+                return _build_replan_clarification_response(
+                    message=message,
+                    db=db,
+                    thread_key=thread_key,
+                    thread_state=thread_state,
+                    effective_thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    meta={
+                        "target_phrase": pending_state.get("target_phrase"),
+                        "time_str": parsed_reply.get("time_str"),
+                        "candidate_task_ids": pending_state.get("candidate_task_ids"),
+                        "requested_start_time": requested_start,
+                        "requested_end_time": requested_end,
+                        "requested_date": extract_date_from_text(message) if _has_explicit_date_cue(message) else None,
+                    },
+                    used_replan_handler=True,
+                )
+
+            target = db.query(Task).filter(Task.id == int(target_task_id)).first()
+            if not target:
+                _clear_pending_state(
+                    db,
+                    thread_key=thread_key,
+                    thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    thread_state=thread_state,
+                    last_intent_type="pending_invalid",
+                    last_user_message=message,
+                )
+                return _build_response(
+                    mode="replan",
+                    message="That task no longer exists. Please resend the change.",
+                    resolved_thread_key=thread_key,
+                    warnings=["Target task for replan was missing."],
+                )
+
+            if not requested_start and not requested_end:
+                return _build_replan_clarification_response(
+                    message=message,
+                    db=db,
+                    thread_key=thread_key,
+                    thread_state=thread_state,
+                    effective_thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    meta={
+                        "target_phrase": target.title,
+                        "time_str": None,
+                        "candidate_task_ids": [target.id],
+                        "requested_start_time": None,
+                        "requested_end_time": None,
+                        "requested_date": None,
+                    },
+                    used_replan_handler=True,
+                )
+
+            duration = task_duration_minutes(target)
+            if requested_start and not requested_end:
+                requested_end = (datetime.combine(target.date, requested_start) + timedelta(minutes=duration)).time()
+
+            # Conflict check
+            def _dt_range_for(task: Task):
+                if not task.start_time:
+                    return None, None
+                s = datetime.combine(task.date, task.start_time)
+                e = datetime.combine(task.date, task.end_time) if task.end_time else s + timedelta(minutes=task_duration_minutes(task))
+                if e <= s:
+                    e = s + timedelta(minutes=max(15, task_duration_minutes(task)))
+                return s, e
+
+            updated_start = requested_start or target.start_time
+            updated_end = requested_end or target.end_time
+            if updated_start and updated_end:
+                conflicts = []
+                for other in db.query(Task).filter(Task.date == target.date, Task.completed == False).all():
+                    if other.id == target.id:
+                        continue
+                    o_s, o_e = _dt_range_for(other)
+                    if not o_s or not o_e:
+                        continue
+                    c_s = datetime.combine(target.date, updated_start)
+                    c_e = datetime.combine(target.date, updated_end)
+                    if _slot_overlaps(c_s, c_e, o_s, o_e):
+                        conflicts.append(other)
+                if conflicts:
+                    suggestions = suggest_alternative_slots(
+                        db=db,
+                        task_date=target.date,
+                        duration_min=duration,
+                        task_text=f"{target.title} {target.description}",
+                        limit=3,
+                    )
+                    pending_intent_id = str(uuid.uuid4())
+                    choice_pairs: list[tuple[str, str]] = []
+                    for s in suggestions:
+                        choice_pairs.append((_format_slot_choice_label(s), f"choose_slot:{s['slot_id']}"))
+                    choice_pairs.append(("Cancel", "cancel"))
+                    choice_map = _build_choice_map(choice_pairs)
+                    save_thread_state(
+                        db,
+                        thread_key,
+                        {
+                            "thread_date": effective_thread_date,
+                            "chat_thread_id": chat_thread_id,
+                            "last_intent_type": "conflict",
+                            "last_user_message": message,
+                            "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                            "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                            "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                            "pending_intent_id": pending_intent_id,
+                            "pending_state_type": "conflict_resolution",
+                            "pending_state": {
+                                "mode": "replan",
+                                "target_task_id": target.id,
+                                "draft": {
+                                    "title": target.title,
+                                    "description": target.description,
+                                    "date": target.date.isoformat(),
+                                    "start_time": updated_start.strftime("%H:%M:%S") if updated_start else None,
+                                    "end_time": updated_end.strftime("%H:%M:%S") if updated_end else None,
+                                    "duration_minutes": duration,
+                                    "priority": int(target.priority or 1),
+                                },
+                                "conflict_ids": [t.id for t in conflicts],
+                                "suggestions": [
+                                    {
+                                        "slot_id": s["slot_id"],
+                                        "date": s["date"].isoformat(),
+                                        "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                        "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                        "score": float(s["score"]),
+                                        "reason": s["reason"],
+                                    }
+                                    for s in suggestions
+                                ],
+                                "choice_map": choice_map,
+                            },
+                        },
+                    )
+                    return _build_response(
+                        mode="conflict",
+                        message=_format_choice_message(
+                            f"I infer you want to move {target.title} to {updated_start.strftime('%I:%M %p').lstrip('0')}. That conflicts with another task.",
+                            choice_pairs,
+                        ),
+                        resolved_thread_key=thread_key,
+                        requires_user_input=True,
+                        pending_intent_id=pending_intent_id,
+                        conflict_info=_build_conflict_prompt(
+                            intent_id=pending_intent_id,
+                            draft={
+                                "title": target.title,
+                                "description": target.description,
+                                "date": target.date,
+                                "start_time": updated_start,
+                                "end_time": updated_end,
+                                "duration_minutes": duration,
+                                "priority": int(target.priority or 1),
+                            },
+                            conflicts=conflicts,
+                            suggestions=suggestions,
+                            actions=["choose_slot:<slot_id>", "cancel"],
+                        ),
+                    )
+
+            before_state = {
+                t.id: (t.date, t.start_time, t.end_time)
+                for t in db.query(Task).filter(Task.date == target.date, Task.completed == False).all()
+            }
+            if requested_start:
+                target.start_time = requested_start
+            if requested_end:
+                target.end_time = requested_end
+            db.commit()
+            updated = _collect_updated_tasks_for_dates(db, {target.date: before_state}, {target.date})
+            updated = [t for t in updated if t.id == target.id]
+
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "replan",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": [target.id],
+                    "last_referenced_task_ids": [target.id],
+                    "pending_intent_id": None,
+                    "pending_state_type": None,
+                    "pending_state": {},
+                },
+            )
+            return _build_response(
+                mode="replan",
+                message="Updated existing task based on your clarification.",
+                updated_tasks=updated or [target],
+                resolved_thread_key=thread_key,
+                applied_after_confirmation=True,
+                affected_dates={target.date},
+            )
         if draft and field == "start_time":
             parsed_time = None
             if isinstance(action_value, str):
@@ -1393,6 +2028,8 @@ def handle_pending_resolution(
         return None
 
     draft = pending_state.get("draft") or {}
+    mode = pending_state.get("mode")
+    target_task_id = pending_state.get("target_task_id")
     if not draft:
         _clear_pending_state(
             db,
@@ -1410,7 +2047,7 @@ def handle_pending_resolution(
             warnings=["Pending conflict state was invalid."],
         )
 
-    action = _parse_pending_action(message, pending_response)
+    action = _parse_pending_action(message, pending_response, pending_state)
     if action is None and confirm is False:
         action = "cancel"
     if action is None and confirm is True:
@@ -1447,6 +2084,7 @@ def handle_pending_resolution(
             }
             for s in suggestions
         ],
+        actions=["choose_slot:<slot_id>", "cancel"] if mode == "replan" else None,
     )
 
     if action in (None, ""):
@@ -1474,6 +2112,149 @@ def handle_pending_resolution(
             mode="replan",
             message="Okay, I canceled that scheduling change.",
             resolved_thread_key=thread_key,
+        )
+
+    if mode == "unscheduled_conflict":
+        phase = pending_state.get("phase") or "choose_task"
+        candidate_ids = pending_state.get("candidate_move_task_ids") or []
+        if phase == "choose_task":
+            chosen_id = None
+            if action and action.startswith("choose_task:"):
+                try:
+                    chosen_id = int(action.split(":", 1)[1])
+                except (TypeError, ValueError):
+                    chosen_id = None
+            if not chosen_id and isinstance(pending_response, dict):
+                raw = pending_response.get("value") or pending_response.get("task_id")
+                try:
+                    chosen_id = int(raw)
+                except (TypeError, ValueError):
+                    chosen_id = None
+            if not chosen_id and isinstance(message, str) and message.strip().isdigit():
+                chosen_id = int(message.strip())
+            if not chosen_id or (candidate_ids and chosen_id not in candidate_ids):
+                return _build_response(
+                    mode="conflict",
+                    message="Please choose which task to move.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=conflict_prompt,
+                )
+
+            chosen_task = db.query(Task).filter(Task.id == chosen_id).first()
+            if not chosen_task:
+                return _build_response(
+                    mode="conflict",
+                    message="That task no longer exists. Please choose a different one.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=conflict_prompt,
+                )
+            duration = task_duration_minutes(chosen_task)
+            suggestions = _suggest_slots_same_day_first(
+                db=db,
+                task_date=chosen_task.date,
+                duration_min=duration,
+                task_text=f"{chosen_task.title} {chosen_task.description}",
+                limit=3,
+            )
+            if not suggestions:
+                return _build_response(
+                    mode="conflict",
+                    message="I couldn't find any available slots. Please provide a time.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=conflict_prompt,
+                    warnings=["No available slots found for chosen task."],
+                )
+            choice_pairs: list[tuple[str, str]] = []
+            for s in suggestions:
+                choice_pairs.append((_format_slot_choice_label(s), f"choose_slot:{s['slot_id']}"))
+            choice_pairs.append(("Cancel", "cancel"))
+            choice_map = _build_choice_map(choice_pairs)
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "conflict",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                    "pending_intent_id": pending_intent_id,
+                    "pending_state_type": "conflict_resolution",
+                    "pending_state": {
+                        "mode": "unscheduled_conflict",
+                        "phase": "choose_slot",
+                        "target_task_id": chosen_task.id,
+                        "unscheduled_task_id": pending_state.get("unscheduled_task_id"),
+                        "unscheduled_intended_start": pending_state.get("unscheduled_intended_start"),
+                        "unscheduled_intended_end": pending_state.get("unscheduled_intended_end"),
+                        "draft": {
+                            "title": chosen_task.title,
+                            "description": chosen_task.description,
+                            "date": chosen_task.date.isoformat(),
+                            "start_time": None,
+                            "end_time": None,
+                            "duration_minutes": duration,
+                            "priority": int(chosen_task.priority or 1),
+                        },
+                        "conflict_ids": pending_state.get("conflict_ids", []),
+                        "suggestions": [
+                            {
+                                "slot_id": s["slot_id"],
+                                "date": s["date"].isoformat(),
+                                "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                "score": float(s["score"]),
+                                "reason": s["reason"],
+                            }
+                            for s in suggestions
+                        ],
+                        "choice_map": choice_map,
+                        "candidate_move_task_ids": candidate_ids,
+                    },
+                },
+            )
+            return _build_response(
+                mode="conflict",
+                message=_format_choice_message(
+                    f"When should I move {chosen_task.title}?",
+                    choice_pairs,
+                ),
+                resolved_thread_key=thread_key,
+                requires_user_input=True,
+                pending_intent_id=pending_intent_id,
+                conflict_info=_build_conflict_prompt(
+                    intent_id=pending_intent_id,
+                    draft={
+                        "title": chosen_task.title,
+                        "description": chosen_task.description,
+                        "date": chosen_task.date,
+                        "start_time": None,
+                        "end_time": None,
+                        "duration_minutes": duration,
+                        "priority": int(chosen_task.priority or 1),
+                    },
+                    conflicts=conflicts,
+                    suggestions=suggestions,
+                    actions=["choose_slot:<slot_id>", "cancel"],
+                ),
+            )
+
+    if mode == "replan" and action == "keep_original_and_move_conflicts":
+        return _build_response(
+            mode="conflict",
+            message="Please choose a slot or cancel.",
+            resolved_thread_key=thread_key,
+            requires_user_input=True,
+            pending_intent_id=pending_intent_id,
+            conflict_info=conflict_prompt,
         )
 
     choose_best = action == "choose_best"
@@ -1506,6 +2287,151 @@ def handle_pending_resolution(
             requires_user_input=True,
             pending_intent_id=pending_intent_id,
             conflict_info=conflict_prompt,
+        )
+
+    if mode == "unscheduled_conflict" and target_task_id:
+        target = db.query(Task).filter(Task.id == int(target_task_id)).first()
+        if not target:
+            _clear_pending_state(
+                db,
+                thread_key=thread_key,
+                thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                thread_state=thread_state,
+                last_intent_type="pending_invalid",
+                last_user_message=message,
+            )
+            return _build_response(
+                mode="replan",
+                message="That task no longer exists. Please resend the change.",
+                resolved_thread_key=thread_key,
+                warnings=["Target task for conflict move was missing."],
+            )
+        draft_date = datetime.strptime(draft["date"], "%Y-%m-%d").date()
+        draft_start = parse_time(draft["start_time"]) if draft.get("start_time") else None
+        draft_end = parse_time(draft["end_time"]) if draft.get("end_time") else None
+        duration = int(draft.get("duration_minutes") or task_duration_minutes(target))
+        if draft_start and not draft_end:
+            draft_end = (datetime.combine(draft_date, draft_start) + timedelta(minutes=duration)).time()
+        before_state = {
+            t.id: (t.date, t.start_time, t.end_time)
+            for t in db.query(Task).filter(Task.date == draft_date, Task.completed == False).all()
+        }
+        target.date = draft_date
+        target.start_time = draft_start
+        target.end_time = draft_end
+        db.commit()
+        updated = _collect_updated_tasks_for_dates(db, {draft_date: before_state}, {draft_date})
+        updated = [t for t in updated if t.id == target.id]
+
+        unscheduled_id = pending_state.get("unscheduled_task_id")
+        intended_start_raw = pending_state.get("unscheduled_intended_start")
+        intended_end_raw = pending_state.get("unscheduled_intended_end")
+        if unscheduled_id and int(unscheduled_id) != target.id and intended_start_raw and intended_end_raw:
+            unscheduled_task = db.query(Task).filter(Task.id == int(unscheduled_id)).first()
+            if unscheduled_task:
+                intended_start = parse_time(intended_start_raw)
+                intended_end = parse_time(intended_end_raw)
+                conflicts = []
+                for other in db.query(Task).filter(Task.date == unscheduled_task.date, Task.completed == False).all():
+                    if other.id == unscheduled_task.id:
+                        continue
+                    o_s, o_e = _task_datetime_range(other)
+                    if not o_s or not o_e:
+                        continue
+                    c_s = datetime.combine(unscheduled_task.date, intended_start)
+                    c_e = datetime.combine(unscheduled_task.date, intended_end)
+                    if _slot_overlaps(c_s, c_e, o_s, o_e):
+                        conflicts.append(other)
+                if not conflicts:
+                    unscheduled_task.start_time = intended_start
+                    unscheduled_task.end_time = intended_end
+                    db.commit()
+
+        save_thread_state(
+            db,
+            thread_key,
+            {
+                "thread_date": effective_thread_date,
+                "chat_thread_id": chat_thread_id,
+                "last_intent_type": "replan",
+                "last_user_message": message,
+                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                "last_updated_task_ids": [target.id],
+                "last_referenced_task_ids": [target.id],
+                "pending_intent_id": None,
+                "pending_state_type": None,
+                "pending_state": {},
+            },
+        )
+        return _build_response(
+            mode="replan",
+            message="Updated task after resolving the conflict.",
+            updated_tasks=updated or [target],
+            resolved_thread_key=thread_key,
+            applied_after_confirmation=bool(choose_best),
+            affected_dates={draft_date},
+        )
+
+    if mode == "replan" and target_task_id:
+        target = db.query(Task).filter(Task.id == int(target_task_id)).first()
+        if not target:
+            _clear_pending_state(
+                db,
+                thread_key=thread_key,
+                thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                thread_state=thread_state,
+                last_intent_type="pending_invalid",
+                last_user_message=message,
+            )
+            return _build_response(
+                mode="replan",
+                message="That task no longer exists. Please resend the change.",
+                resolved_thread_key=thread_key,
+                warnings=["Target task for replan was missing."],
+            )
+        draft_date = datetime.strptime(draft["date"], "%Y-%m-%d").date()
+        draft_start = parse_time(draft["start_time"]) if draft.get("start_time") else None
+        draft_end = parse_time(draft["end_time"]) if draft.get("end_time") else None
+        duration = int(draft.get("duration_minutes") or task_duration_minutes(target))
+        if draft_start and not draft_end:
+            draft_end = (datetime.combine(draft_date, draft_start) + timedelta(minutes=duration)).time()
+        before_state = {
+            t.id: (t.date, t.start_time, t.end_time)
+            for t in db.query(Task).filter(Task.date == draft_date, Task.completed == False).all()
+        }
+        target.date = draft_date
+        if draft_start:
+            target.start_time = draft_start
+        if draft_end:
+            target.end_time = draft_end
+        db.commit()
+        updated = _collect_updated_tasks_for_dates(db, {draft_date: before_state}, {draft_date})
+        updated = [t for t in updated if t.id == target.id]
+        save_thread_state(
+            db,
+            thread_key,
+            {
+                "thread_date": effective_thread_date,
+                "chat_thread_id": chat_thread_id,
+                "last_intent_type": "replan",
+                "last_user_message": message,
+                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                "last_updated_task_ids": [target.id],
+                "last_referenced_task_ids": [target.id],
+                "pending_intent_id": None,
+                "pending_state_type": None,
+                "pending_state": {},
+            },
+        )
+        return _build_response(
+            mode="replan",
+            message="Updated existing task based on your choice.",
+            updated_tasks=updated or [target],
+            resolved_thread_key=thread_key,
+            applied_after_confirmation=bool(choose_best),
+            affected_dates={draft_date},
         )
 
     draft_date = datetime.strptime(draft["date"], "%Y-%m-%d").date()
@@ -1612,7 +2538,15 @@ def _save_ask_user_pending_state(
     return pending_intent_id
 
 
-def _build_ask_user_response(thread_key: str, pending_intent_id: str, field: str, question: str, options_raw: list[dict], used_replan_handler: bool = False) -> ChatResponse:
+def _build_ask_user_response(
+    thread_key: str,
+    pending_intent_id: str,
+    field: str,
+    question: str,
+    options_raw: list[dict],
+    used_replan_handler: bool = False,
+    allow_free_text: bool = True,
+) -> ChatResponse:
     return _build_response(
         mode="ask_user",
         message=question,
@@ -1625,26 +2559,161 @@ def _build_ask_user_response(thread_key: str, pending_intent_id: str, field: str
             field=field,
             question=question,
             options=options_raw,
+            allow_free_text=allow_free_text,
         ),
     )
 
 
+def _build_replan_clarification_response(
+    message: str,
+    db: Session,
+    thread_key: str,
+    thread_state: dict,
+    effective_thread_date: date,
+    chat_thread_id: str | None,
+    meta: dict,
+    used_replan_handler: bool = False,
+) -> ChatResponse:
+    target_phrase = meta.get("target_phrase")
+    time_str = meta.get("time_str")
+    candidate_ids = meta.get("candidate_task_ids") or thread_state.get("last_referenced_task_ids", [])[:5]
+    candidate_tasks = []
+    if candidate_ids:
+        ref_tasks = db.query(Task).filter(Task.id.in_(candidate_ids)).all()
+        by_id = {t.id: t for t in ref_tasks}
+        candidate_tasks = [by_id[tid] for tid in candidate_ids if tid in by_id]
+
+    target_task_id = candidate_tasks[0].id if len(candidate_tasks) == 1 else None
+    requested_start_time = meta.get("requested_start_time")
+    requested_end_time = meta.get("requested_end_time")
+
+    options_raw: list[dict] = []
+    choice_pairs: list[tuple[str, str]] = []
+
+    if target_task_id and not requested_start_time and not requested_end_time:
+        target_task = candidate_tasks[0]
+        question = f"Choose a new time slot for {target_task.title}."
+        suggestions = suggest_alternative_slots(
+            db=db,
+            task_date=target_task.date,
+            duration_min=task_duration_minutes(target_task),
+            task_text=f"{target_task.title} {target_task.description}",
+            limit=3,
+        )
+        if suggestions:
+            for s in suggestions:
+                label = _format_slot_choice_label(s)
+                value = s["start_time"].strftime("%H:%M:%S")
+                choice_pairs.append((label, value))
+        else:
+            fallback = _dynamic_time_options_for_draft(
+                db,
+                {
+                    "title": target_task.title,
+                    "description": target_task.description,
+                    "date": target_task.date,
+                    "duration_minutes": task_duration_minutes(target_task),
+                },
+                limit=3,
+            )
+            for s in fallback:
+                choice_pairs.append((s["label"], s["value"]))
+        choice_pairs.append(("Cancel", "cancel"))
+    else:
+        if target_phrase and time_str:
+            question = f"Which task should I move to {time_str}?"
+        elif target_phrase:
+            question = f"Which task should I move?"
+        elif time_str:
+            question = f"Which task should I move to {time_str}?"
+        else:
+            question = "Which task should I change?"
+        for t in candidate_tasks:
+            label = _format_task_choice_label(t)
+            value = f"task-{t.id}"
+            choice_pairs.append((label, value))
+        choice_pairs.append(("Cancel", "cancel"))
+
+    for idx, (label, value) in enumerate(choice_pairs, 1):
+        options_raw.append(
+            {
+                "id": str(idx),
+                "label": label,
+                "value": value,
+            }
+        )
+    choice_map = _build_choice_map(choice_pairs)
+
+    pending_intent_id = _save_ask_user_pending_state(
+        db=db,
+        thread_key=thread_key,
+        thread_state=thread_state,
+        effective_thread_date=effective_thread_date,
+        chat_thread_id=chat_thread_id,
+        message=message,
+        field="target_task",
+        question=question,
+        options_raw=options_raw,
+        extra_pending_state={
+            "intent": "replan",
+            "target_phrase": target_phrase,
+            "requested_start_time": _time_to_str(meta.get("requested_start_time")),
+            "requested_end_time": _time_to_str(meta.get("requested_end_time")),
+            "requested_date": meta.get("requested_date").isoformat()
+            if meta.get("requested_date")
+            else None,
+            "candidate_task_ids": candidate_ids,
+            "choice_map": choice_map,
+        },
+    )
+    return _build_ask_user_response(
+        thread_key,
+        pending_intent_id,
+        "target_task",
+        question,
+        options_raw,
+        used_replan_handler=used_replan_handler,
+        allow_free_text=False,
+    )
+
+
+def _build_unscheduled_conflict_prompt(
+    unscheduled_task: Task,
+    conflicts: list[Task],
+    intent_id: str,
+) -> ConflictPrompt:
+    draft = {
+        "title": unscheduled_task.title,
+        "description": unscheduled_task.description,
+        "date": unscheduled_task.date,
+        "start_time": unscheduled_task.start_time,
+        "end_time": unscheduled_task.end_time,
+        "duration_minutes": task_duration_minutes(unscheduled_task),
+        "priority": int(unscheduled_task.priority or 1),
+    }
+    return _build_conflict_prompt(
+        intent_id=intent_id,
+        draft=draft,
+        conflicts=conflicts,
+        suggestions=[],
+        actions=["choose_task:<task_id>", "cancel"],
+    )
+
 def _normalize_args_list(decision: Any, message: str) -> tuple[list[dict], bool]:
     fallback_multi = split_tasks_from_message(message)
     used_fallback_parser = False
-    args_list = decision.arguments if decision.action == "create_task" else fallback_multi
-    if decision.action != "create_task":
-        used_fallback_parser = bool(fallback_multi)
+    args_list = decision.arguments if decision.action == "create_task" else []
     if isinstance(args_list, dict):
         args_list = [args_list]
     if not args_list:
-        args_list = fallback_multi
-        used_fallback_parser = True
+        if decision.action == "create_task":
+            args_list = fallback_multi
+            used_fallback_parser = bool(fallback_multi)
     elif len(args_list) == 1:
         only = args_list[0] or {}
         only_title = (only.get("title") or "").strip().lower()
         input_clean = message.strip().lower()
-        if len(fallback_multi) > 1 and (not only_title or only_title == input_clean):
+        if decision.action == "create_task" and len(fallback_multi) > 1 and (not only_title or only_title == input_clean):
             args_list = fallback_multi
             used_fallback_parser = True
     return args_list or [], used_fallback_parser
@@ -1659,45 +2728,14 @@ def _handle_non_create_decision(
     effective_thread_date: date,
     chat_thread_id: str | None,
 ) -> tuple[ChatResponse | None, list[dict], bool]:
-    fallback_multi = split_tasks_from_message(message)
     if decision.action == "create_task":
         return None, [], False
 
-    replanned, replan_meta = handle_followup_replan(
-        message,
-        db,
-        thread_state=thread_state,
-        reference_date=effective_thread_date,
-        return_metadata=True,
-    )
-    if replanned:
-        referenced_ids = [t.id for t in replanned][:10]
-        save_thread_state(
-            db,
-            thread_key,
-            {
-                "thread_date": effective_thread_date,
-                "chat_thread_id": chat_thread_id,
-                "last_intent_type": "replan",
-                "last_user_message": message,
-                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
-                "last_updated_task_ids": referenced_ids,
-                "last_referenced_task_ids": referenced_ids,
-            },
-        )
-        return (
-            _build_response(
-                mode="replan",
-                message="Updated existing tasks based on your follow-up request.",
-                updated_tasks=replanned,
-                used_replan_handler=True,
-                resolved_thread_key=thread_key,
-                memory_used=bool(replan_meta.get("memory_used")),
-                affected_dates={t.date for t in replanned},
-            ),
-            [],
-            False,
-        )
+    # If message looks like a fresh plan, route to create flow even when model misclassifies.
+    fallback_multi = split_tasks_from_message(message)
+    inferred_action = _infer_fallback_action(message, thread_state)
+    if inferred_action == "create_task":
+        return None, fallback_multi, True
 
     if decision.action == "get_schedule":
         tasks = get_schedule(effective_thread_date, db)
@@ -1727,66 +2765,226 @@ def _handle_non_create_decision(
             False,
         )
 
-    if not fallback_multi:
-        lower = (message or "").lower()
-        if any(k in lower for k in ["move", "change", "shift", "reschedule"]):
-            question = "Which task should I change? Share the task title or current time slot."
-            options_raw = []
-            refs = thread_state.get("last_referenced_task_ids", [])[:3]
-            if refs:
-                ref_tasks = db.query(Task).filter(Task.id.in_(refs)).all()
-                by_id = {t.id: t for t in ref_tasks}
-                for tid in refs:
-                    t = by_id.get(tid)
-                    if not t:
-                        continue
-                    options_raw.append(
-                        {
-                            "id": f"task-{t.id}",
-                            "label": f"{t.title} ({t.date.isoformat()})",
-                            "value": str(t.id),
-                        }
-                    )
-            pending_intent_id = _save_ask_user_pending_state(
+    if decision.action == "replan_day":
+        replanned, replan_meta = handle_followup_replan(
+            message,
+            db,
+            thread_state=thread_state,
+            reference_date=effective_thread_date,
+            return_metadata=True,
+        )
+        if replanned:
+            referenced_ids = [t.id for t in replanned][:10]
+            affected_dates = {t.date for t in replanned}
+            all_day_tasks = []
+            for d in affected_dates:
+                all_day_tasks.extend(
+                    db.query(Task)
+                    .filter(Task.date == d, Task.completed == False)
+                    .order_by(Task.start_time.asc(), Task.priority.desc(), Task.id.asc())
+                    .all()
+                )
+            replanned_ids = {t.id for t in replanned}
+            unchanged = [t for t in all_day_tasks if t.id not in replanned_ids]
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "replan",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": referenced_ids,
+                    "last_referenced_task_ids": referenced_ids,
+                },
+            )
+            return (
+                _build_response(
+                    mode="replan",
+                    message="Updated existing tasks based on your follow-up request.",
+                    updated_tasks=replanned,
+                    unchanged_tasks=unchanged,
+                    used_replan_handler=True,
+                    resolved_thread_key=thread_key,
+                    memory_used=bool(replan_meta.get("memory_used")),
+                    affected_dates=affected_dates,
+                ),
+                [],
+                False,
+            )
+
+        target_phrase = replan_meta.get("target_phrase")
+        time_str = replan_meta.get("time_str")
+        if replan_meta.get("conflict_task_id"):
+            anchor = db.query(Task).filter(Task.id == int(replan_meta["conflict_task_id"])).first()
+            conflict_ids = [int(i) for i in replan_meta.get("conflicting_ids", [])]
+            conflicts = db.query(Task).filter(Task.id.in_(conflict_ids)).all() if conflict_ids else []
+            draft_date = anchor.date if anchor else effective_thread_date
+            draft_start = replan_meta.get("proposed_start_time")
+            draft_end = replan_meta.get("proposed_end_time")
+            duration = int(replan_meta.get("duration_minutes") or 60)
+            suggestions = suggest_alternative_slots(
+                db=db,
+                task_date=draft_date,
+                duration_min=duration,
+                task_text=f"{anchor.title if anchor else ''} {anchor.description if anchor else ''}",
+                limit=3,
+            )
+            draft = {
+                "title": anchor.title if anchor else "Updated task",
+                "description": anchor.description if anchor else "Proposed replan update.",
+                "date": draft_date,
+                "start_time": draft_start,
+                "end_time": draft_end,
+                "duration_minutes": duration,
+                "priority": int(anchor.priority if anchor else 1),
+            }
+            conflict_titles = ", ".join([t.title for t in conflicts]) if conflicts else "another task"
+            move_time_str = draft_start.strftime("%I:%M %p").lstrip("0") if draft_start else "that time"
+            pending_intent_id = str(uuid.uuid4())
+            choice_pairs: list[tuple[str, str]] = []
+            for s in suggestions:
+                choice_pairs.append((_format_slot_choice_label(s), f"choose_slot:{s['slot_id']}"))
+            choice_pairs.append(("Cancel", "cancel"))
+            choice_map = _build_choice_map(choice_pairs)
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "conflict",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                    "pending_intent_id": pending_intent_id,
+                    "pending_state_type": "conflict_resolution",
+                    "pending_state": {
+                        "mode": "replan",
+                        "target_task_id": anchor.id if anchor else None,
+                        "draft": {
+                            "title": draft["title"],
+                            "description": draft["description"],
+                            "date": draft_date.isoformat() if draft_date else None,
+                            "start_time": draft_start.strftime("%H:%M:%S") if draft_start else None,
+                            "end_time": draft_end.strftime("%H:%M:%S") if draft_end else None,
+                            "duration_minutes": duration,
+                            "priority": int(anchor.priority if anchor else 1),
+                        },
+                        "conflict_ids": [t.id for t in conflicts],
+                        "suggestions": [
+                            {
+                                "slot_id": s["slot_id"],
+                                "date": s["date"].isoformat(),
+                                "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                "score": float(s["score"]),
+                                "reason": s["reason"],
+                            }
+                            for s in suggestions
+                        ],
+                        "requested_start_time": _time_to_str(replan_meta.get("requested_start_time")),
+                        "requested_end_time": _time_to_str(replan_meta.get("requested_end_time")),
+                        "choice_map": choice_map,
+                    },
+                },
+            )
+            return (
+                _build_response(
+                    mode="conflict",
+                    message=_format_choice_message(
+                        f"I infer you want to move {anchor.title if anchor else 'this task'} to {move_time_str}, but it conflicts with {conflict_titles}. Choose a different slot or cancel.",
+                        choice_pairs,
+                    ),
+                    used_replan_handler=True,
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=_build_conflict_prompt(
+                        intent_id=pending_intent_id,
+                        draft=draft,
+                        conflicts=conflicts,
+                        suggestions=suggestions,
+                        actions=[
+                            "choose_slot:<slot_id>",
+                            "cancel",
+                        ],
+                    ),
+                ),
+                [],
+                False,
+            )
+
+        return (
+            _build_replan_clarification_response(
+                message=message,
                 db=db,
                 thread_key=thread_key,
                 thread_state=thread_state,
                 effective_thread_date=effective_thread_date,
                 chat_thread_id=chat_thread_id,
-                message=message,
-                field="target_task",
-                question=question,
-                options_raw=options_raw,
-            )
-            return (_build_ask_user_response(thread_key, pending_intent_id, "target_task", question, options_raw, used_replan_handler=True), [], False)
-
-        save_thread_state(
-            db,
-            thread_key,
-            {
-                "thread_date": effective_thread_date,
-                "chat_thread_id": chat_thread_id,
-                "last_intent_type": "replan",
-                "last_user_message": message,
-                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
-                "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
-                "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
-            },
-        )
-        return (
-            _build_response(
-                mode="replan",
-                message="No matching task updates were applied.",
+                meta=replan_meta,
                 used_replan_handler=True,
-                resolved_thread_key=thread_key,
-                memory_used=bool(replan_meta.get("memory_used")),
-                warnings=["No matching tasks found for this follow-up request."],
             ),
             [],
             False,
         )
 
-    return None, fallback_multi, True
+    inferred_action = _infer_fallback_action(message, thread_state)
+    inferred_label = {
+        "replan_day": "replan",
+        "get_schedule": "show your schedule",
+    }.get(inferred_action, "help with scheduling")
+    if inferred_action == "replan_day":
+        _, replan_meta = handle_followup_replan(
+            message,
+            db,
+            thread_state=thread_state,
+            reference_date=effective_thread_date,
+            return_metadata=True,
+            dry_run=True,
+        )
+        return (
+            _build_replan_clarification_response(
+                message=message,
+                db=db,
+                thread_key=thread_key,
+                thread_state=thread_state,
+                effective_thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                meta=replan_meta,
+                used_replan_handler=True,
+            ),
+            [],
+            False,
+        )
+    elif inferred_action == "get_schedule":
+        question = "I infer you want to view your schedule. Is that correct?"
+    else:
+        question = f"I infer you want me to {inferred_label}. Is that correct?"
+    options_raw = [
+        {"id": "yes", "label": "Yes", "value": "yes"},
+        {"id": "no", "label": "No", "value": "no"},
+        {"id": "corrections", "label": "Make Corrections", "value": "make corrections"},
+    ]
+    return (
+        _build_response(
+            mode="ask_user",
+            message=question,
+            resolved_thread_key=thread_key,
+            requires_user_input=True,
+            clarification=_build_clarification_prompt(
+                intent_id=str(uuid.uuid4()),
+                field="intent",
+                question=question,
+                options=options_raw,
+            ),
+        ),
+        [],
+        False,
+    )
 
 
 def _maybe_return_interactive_create_gate(
@@ -1837,6 +3035,12 @@ def _maybe_return_interactive_create_gate(
         conflicts, suggestions = detect_conflicts_for_draft(db, draft)
         if conflicts:
             pending_intent_id = str(uuid.uuid4())
+            choice_pairs: list[tuple[str, str]] = []
+            for s in suggestions:
+                choice_pairs.append((_format_slot_choice_label(s), f"choose_slot:{s['slot_id']}"))
+            choice_pairs.append(("Keep original time and move conflicts", "keep_original_and_move_conflicts"))
+            choice_pairs.append(("Cancel", "cancel"))
+            choice_map = _build_choice_map(choice_pairs)
             pending_state = {
                 "draft": {
                     "title": draft["title"],
@@ -1859,6 +3063,7 @@ def _maybe_return_interactive_create_gate(
                     }
                     for s in suggestions
                 ],
+                "choice_map": choice_map,
             }
             save_thread_state(
                 db,
@@ -1878,7 +3083,10 @@ def _maybe_return_interactive_create_gate(
             )
             return _build_response(
                 mode="conflict",
-                message="I found a scheduling conflict. Pick one of the suggested slots or actions.",
+                message=_format_choice_message(
+                    "I found a scheduling conflict. Choose an option.",
+                    choice_pairs,
+                ),
                 resolved_thread_key=thread_key,
                 requires_user_input=True,
                 pending_intent_id=pending_intent_id,
@@ -1901,17 +3109,65 @@ def _execute_create_args(
     thread_state: dict,
     effective_thread_date: date,
     chat_thread_id: str | None,
-) -> tuple[ChatResponse | None, list[Task], set[date], dict, dict]:
+) -> tuple[ChatResponse | None, list[Task], set[date], dict, dict, dict, dict]:
     created_tasks = []
     affected_dates = set()
     pinned_task_ids_by_date = {}
     before_state_by_date = {}
+    latest_end_by_task_id_by_date: dict[date, dict[int, datetime]] = {}
+    intended_times_by_task_id: dict[int, tuple[time | None, time | None]] = {}
+    ordered_mode = bool(re.search(r"\b(then|followed by|after that|after this|after)\b", (message or "").lower()))
+    last_end_by_date: dict[date, time] = {}
+    event_start_by_date: dict[date, time] = {}
 
     def ensure_before_state(target_date):
         if target_date in before_state_by_date:
             return
         tasks = db.query(Task).filter(Task.date == target_date, Task.completed == False).all()
         before_state_by_date[target_date] = {t.id: (t.date, t.start_time, t.end_time) for t in tasks}
+
+    # Precompute event anchors in the message to keep prep sessions before the event.
+    for args in args_list or []:
+        raw_text = f"{args.get('title') or ''} {args.get('description') or ''}".strip()
+        if not raw_text:
+            continue
+        if not _is_event_like(raw_text):
+            continue
+        task_date_str = args.get("date")
+        event_date = datetime.strptime(task_date_str, "%Y-%m-%d").date() if task_date_str else effective_thread_date
+        start_time_str = args.get("start_time")
+        start_time_val = parse_time(start_time_str.strip()) if isinstance(start_time_str, str) and start_time_str.strip() else None
+        if not start_time_val:
+            start_time_val = extract_time_from_text(raw_text)
+        if start_time_val:
+            existing = event_start_by_date.get(event_date)
+            if not existing or start_time_val < existing:
+                event_start_by_date[event_date] = start_time_val
+
+    def find_slot_before(task_date: date, duration_min: int, latest_end: time):
+        day_start = datetime.combine(task_date, time(9, 0))
+        day_end = datetime.combine(task_date, latest_end)
+        now = datetime.now()
+        if task_date == now.date():
+            day_start = max(day_start, now.replace(second=0, microsecond=0))
+        if day_end <= day_start:
+            return None
+        occupied = []
+        for t in db.query(Task).filter(Task.date == task_date, Task.completed == False).all():
+            s, e = _task_datetime_range(t)
+            if s and e:
+                occupied.append((s, e))
+        step = timedelta(minutes=15)
+        latest_start = day_end - timedelta(minutes=duration_min)
+        cur = latest_start
+        while cur >= day_start:
+            slot_start = cur
+            slot_end = cur + timedelta(minutes=duration_min)
+            conflict = any(_slot_overlaps(slot_start, slot_end, o_s, o_e) for o_s, o_e in occupied)
+            if not conflict:
+                return slot_start.time(), slot_end.time()
+            cur -= step
+        return None
 
     for args in args_list or []:
         draft = _normalize_task_draft(args=args or {}, message=message, effective_date=effective_thread_date, db=db)
@@ -1948,8 +3204,20 @@ def _execute_create_args(
 
         start_time_val = parse_time(start_time_str.strip()) if isinstance(start_time_str, str) and start_time_str.strip() else None
         end_time_val = parse_time(end_time_str.strip()) if isinstance(end_time_str, str) and end_time_str.strip() else None
+        has_explicit_start = bool(start_time_val)
+        sequence_assigned_start = False
+        local_text = f"{args.get('title') or ''} {args.get('description') or ''}".strip()
+        local_text_lower = local_text.lower()
         if not start_time_val:
-            start_time_val = extract_time_from_text(f"{args.get('title') or ''} {args.get('description') or ''} {message}")
+            # Important: only parse time from this task text, not the full message.
+            is_prep = any(k in local_text_lower for k in ["prep", "prepare", "study", "revision", "review"])
+            event_anchor = None
+            effective_date = task_date or base_date
+            if is_prep and event_start_by_date.get(effective_date):
+                event_anchor = event_start_by_date.get(effective_date)
+            if not event_anchor:
+                start_time_val = extract_time_from_text(local_text)
+            has_explicit_start = bool(start_time_val)
 
         effective_date = task_date or base_date
         if not total_effort:
@@ -1963,6 +3231,29 @@ def _execute_create_args(
                 historical_avg=historical_avg,
                 deadline_date=deadline_date,
             )
+
+        # Preserve narrative order for chained requests: "..., then X, followed by Y ...".
+        if ordered_mode and not start_time_val:
+            prev_end = last_end_by_date.get(effective_date)
+            if prev_end:
+                start_time_val = (
+                    datetime.combine(effective_date, prev_end) + timedelta(minutes=5)
+                ).time()
+                sequence_assigned_start = True
+            local_text_for_order = f"{args.get('title') or ''} {args.get('description') or ''}".lower()
+            # Keep "rest of the night" in evening.
+            if "rest of the night" in local_text_for_order and (not start_time_val or start_time_val < time(19, 0)):
+                start_time_val = time(19, 0)
+                sequence_assigned_start = True
+            # Routine anchors for better human-like defaults.
+            if any(k in local_text_for_order for k in ["dinner", "eat dinner", "have dinner", "supper"]):
+                if not start_time_val or start_time_val < time(19, 0):
+                    start_time_val = time(19, 0)
+                    sequence_assigned_start = True
+            if any(k in local_text_for_order for k in ["sleep", "go to bed", "bedtime"]):
+                if not start_time_val or start_time_val < time(22, 0):
+                    start_time_val = time(22, 0)
+                    sequence_assigned_start = True
 
         if start_time_val and not end_time_val and total_effort:
             end_time_val = (datetime.combine(effective_date, start_time_val) + timedelta(minutes=total_effort)).time()
@@ -1985,6 +3276,8 @@ def _execute_create_args(
                 affected_dates.add(session_date)
                 if start_time_val:
                     pinned_task_ids_by_date.setdefault(session_date, set()).add(task.id)
+                    if task.end_time:
+                        last_end_by_date[session_date] = task.end_time
                 created_tasks.append(task)
                 continue
 
@@ -2016,6 +3309,15 @@ def _execute_create_args(
         if not task_date:
             task_date = base_date
         ensure_before_state(task_date)
+        # If this is a prep task with an event time anchor, try to place it before the event.
+        if not start_time_val:
+            is_prep = any(k in local_text_lower for k in ["prep", "prepare", "study", "revision", "review"])
+            event_anchor = event_start_by_date.get(task_date)
+            if is_prep and event_anchor:
+                slot = find_slot_before(task_date, int(total_effort or 60), event_anchor)
+                if slot:
+                    start_time_val, end_time_val = slot
+                    sequence_assigned_start = True
         task = create_task(
             db=db,
             title=text,
@@ -2027,11 +3329,19 @@ def _execute_create_args(
             duration_minutes=total_effort,
         )
         affected_dates.add(task_date)
-        if start_time_val:
+        if (has_explicit_start or sequence_assigned_start) and start_time_val:
             pinned_task_ids_by_date.setdefault(task_date, set()).add(task.id)
+        if has_explicit_start:
+            intended_times_by_task_id[task.id] = (start_time_val, end_time_val)
+        if any(k in local_text_lower for k in ["prep", "prepare", "study", "revision", "review"]):
+            event_anchor = event_start_by_date.get(task_date)
+            if event_anchor:
+                latest_end_by_task_id_by_date.setdefault(task_date, {})[task.id] = datetime.combine(task_date, event_anchor)
+        if task.end_time:
+            last_end_by_date[task_date] = task.end_time
         created_tasks.append(task)
 
-    return None, created_tasks, affected_dates, pinned_task_ids_by_date, before_state_by_date
+    return None, created_tasks, affected_dates, pinned_task_ids_by_date, before_state_by_date, latest_end_by_task_id_by_date, intended_times_by_task_id
 
 
 def process_chat_request(
@@ -2071,6 +3381,25 @@ def process_chat_request(
     decision = decide_fn(model_input)
 
     if decision.action == "ask_user":
+        if _looks_like_followup_instruction(message) and _has_thread_task_context(thread_state):
+            _, replan_meta = handle_followup_replan(
+                message,
+                db,
+                thread_state=thread_state,
+                reference_date=effective_thread_date,
+                return_metadata=True,
+                dry_run=True,
+            )
+            return _build_replan_clarification_response(
+                message=message,
+                db=db,
+                thread_key=thread_key,
+                thread_state=thread_state,
+                effective_thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                meta=replan_meta,
+                used_replan_handler=True,
+            )
         args = decision.arguments if isinstance(decision.arguments, dict) else {}
         field = args.get("field") or "detail"
         question = args.get("question") or decision.message or "Please clarify so I can continue."
@@ -2105,7 +3434,16 @@ def process_chat_request(
         args_list = fallback_from_non_create
         used_fallback_parser = True
 
-    interactive_response, created_tasks, affected_dates, pinned_task_ids_by_date, before_state_by_date = _execute_create_args(
+    if decision.action == "create_task" and not args_list:
+        # Per user request: do not ask generic clarification for create_task.
+        return _build_response(
+            mode="create",
+            message="No tasks were created because no task details were found.",
+            resolved_thread_key=thread_key,
+            warnings=["No task details found in the request."],
+        )
+
+    interactive_response, created_tasks, affected_dates, pinned_task_ids_by_date, before_state_by_date, latest_end_by_task_id_by_date, intended_times_by_task_id = _execute_create_args(
         message=message,
         args_list=args_list,
         decision=decision,
@@ -2118,12 +3456,119 @@ def process_chat_request(
     if interactive_response:
         return interactive_response
 
+    # If any created task with an explicit time conflicts with existing tasks, ask before moving anything.
+    for d in affected_dates:
+        existing_ids = set(before_state_by_date.get(d, {}).keys())
+        if not existing_ids:
+            continue
+        existing_tasks = db.query(Task).filter(Task.id.in_(existing_ids)).all()
+        existing_ranges = []
+        for t in existing_tasks:
+            s, e = _task_datetime_range(t)
+            if s and e:
+                existing_ranges.append((t, s, e))
+        for t in created_tasks:
+            if t.date != d:
+                continue
+            intended = intended_times_by_task_id.get(t.id)
+            if not intended:
+                continue
+            start_t, end_t = intended
+            if not start_t or not end_t:
+                continue
+            s = datetime.combine(d, start_t)
+            e = datetime.combine(d, end_t)
+            conflicts = []
+            for other, o_s, o_e in existing_ranges:
+                if _slot_overlaps(s, e, o_s, o_e):
+                    conflicts.append(other)
+            if conflicts:
+                # Clear the conflicting task's time so it doesn't overlap until resolved.
+                t.start_time = None
+                t.end_time = None
+                db.commit()
+                pending_intent_id = str(uuid.uuid4())
+                conflict_prompt = _build_unscheduled_conflict_prompt(t, conflicts, pending_intent_id)
+                choice_tasks = [t] + conflicts
+                choice_pairs = [(_format_task_choice_label(task), f"choose_task:{task.id}") for task in choice_tasks]
+                choice_pairs.append(("Cancel", "cancel"))
+                choice_map = _build_choice_map(choice_pairs)
+                save_thread_state(
+                    db,
+                    thread_key,
+                    {
+                        "thread_date": effective_thread_date,
+                        "chat_thread_id": chat_thread_id,
+                        "last_intent_type": "conflict",
+                        "last_user_message": message,
+                        "last_created_task_ids": [task.id for task in created_tasks][:10],
+                        "last_updated_task_ids": [],
+                        "last_referenced_task_ids": [t.id] + [c.id for c in conflicts][:9],
+                        "pending_intent_id": pending_intent_id,
+                        "pending_state_type": "conflict_resolution",
+                        "pending_state": {
+                            "mode": "unscheduled_conflict",
+                            "phase": "choose_task",
+                            "unscheduled_task_id": t.id,
+                            "conflict_ids": [c.id for c in conflicts],
+                            "candidate_move_task_ids": [t.id] + [c.id for c in conflicts],
+                            "choice_map": choice_map,
+                            "draft": {
+                                "title": t.title,
+                                "description": t.description,
+                                "date": d.isoformat(),
+                                "start_time": None,
+                                "end_time": None,
+                                "duration_minutes": task_duration_minutes(t),
+                                "priority": int(t.priority or 1),
+                            },
+                            "unscheduled_intended_start": start_t.strftime("%H:%M:%S"),
+                            "unscheduled_intended_end": end_t.strftime("%H:%M:%S"),
+                        },
+                    },
+                )
+                conflict_titles = ", ".join([c.title for c in conflicts])
+                return _build_response(
+                    mode="conflict",
+                    message=_format_choice_message(
+                        f"Task {t.title} couldn't be scheduled because it conflicts with {conflict_titles}. Which task should I move?",
+                        choice_pairs,
+                    ),
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=conflict_prompt,
+                    affected_dates=affected_dates,
+                )
+
+    existing_pinned_by_date = {d: set(before_state_by_date.get(d, {}).keys()) for d in affected_dates}
     for d in affected_dates:
         rebalance_day(
             db,
             d,
-            pinned_task_ids=pinned_task_ids_by_date.get(d, set()),
+            pinned_task_ids=(pinned_task_ids_by_date.get(d, set()) | existing_pinned_by_date.get(d, set())),
+            latest_end_by_task_id=latest_end_by_task_id_by_date.get(d),
         )
+
+    # Restore existing tasks to their original times to avoid unintended moves.
+    for d in affected_dates:
+        before_state = before_state_by_date.get(d, {})
+        if not before_state:
+            continue
+        existing_ids = set(before_state.keys())
+        tasks = db.query(Task).filter(Task.id.in_(existing_ids)).all()
+        changed = False
+        for t in tasks:
+            before = before_state.get(t.id)
+            if not before:
+                continue
+            _, before_start, before_end = before
+            if t.start_time != before_start or t.end_time != before_end:
+                t.start_time = before_start
+                t.end_time = before_end
+                changed = True
+        if changed:
+            db.commit()
 
     updated_tasks = _collect_updated_tasks_for_dates(db, before_state_by_date, affected_dates)
     created_ids = {t.id for t in created_tasks}

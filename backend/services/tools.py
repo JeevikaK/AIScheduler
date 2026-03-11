@@ -36,6 +36,20 @@ def create_task(db: Session, title: str, description: str, date, start_time=None
         "completed": completed,
         "duration_minutes": duration_minutes,
     }
+    existing = (
+        db.query(Task)
+        .filter(
+            Task.title == title,
+            Task.date == date,
+            Task.start_time == start_time,
+            Task.end_time == end_time,
+            Task.completed == False,
+        )
+        .first()
+    )
+    if existing:
+        return existing
+
     db_task = Task(**task_data)
     db.add(db_task)
     db.commit()
@@ -88,16 +102,11 @@ def get_reflection(date: date, db: Session = Depends(get_db)):
 def get_today_schedule(db: Session = Depends(get_db)):
     today = date.today()
 
-    # 1. Auto-reschedule overdue tasks
-    overdue_tasks = get_overdue_tasks(db)
-    for task in overdue_tasks:
-        reschedule_task(task, db)
-
-    # 2. Fetch today's mood / energy
+    # 1. Fetch today's mood / energy
     mood = db.query(Mood).filter(Mood.date == today).first()
     energy = mood.energy if mood else 3
 
-    # 3. Fetch today's tasks
+    # 2. Fetch today's tasks (no auto-reschedule)
     tasks = (
         db.query(Task)
         .filter(Task.date == today)
@@ -105,7 +114,7 @@ def get_today_schedule(db: Session = Depends(get_db)):
         .all()
     )
 
-    # 4. Agent-style summary message
+    # 3. Agent-style summary message
     if energy <= 2:
         message = "Low-energy day detected. Focus on light or high-priority tasks."
     elif energy >= 4:
@@ -122,33 +131,14 @@ def get_today_schedule(db: Session = Depends(get_db)):
 
 def get_schedule(schedule_date: date, db: Session = Depends(get_db)):
     tasks = db.query(Task).filter(Task.date == schedule_date).all()
-    
-    today_mood = db.query(Mood).filter(Mood.date == schedule_date).first()
-    energy = today_mood.energy if today_mood else 3  # default medium energy
-
-    def task_priority(t):
-    # Start datetime
-        start = datetime.combine(t.date, t.start_time or time(9, 0))
-        # End datetime (use end_time if exists, else 60 min duration)
-        if t.end_time:
-            end = datetime.combine(t.date, t.end_time)
-        else:
-            end = start + timedelta(minutes=60)
-        duration = (end - start).total_seconds() / 60  # duration in minutes
-
-        energy = t.energy if hasattr(t, 'energy') else 3  # fallback if needed
-
-        # Energy-based adjustment
-        if energy <= 2:
-            return duration           # low energy → short tasks first
-        elif energy >= 4:
-            return -duration          # high energy → long tasks first
-        else:
-            return start.hour*60 + start.minute  # medium energy → keep original order
-
-    # Sort tasks: incomplete first, then by priority
-    tasks.sort(key=lambda t: (t.completed, task_priority(t)))
-    
+    tasks.sort(
+        key=lambda t: (
+            1 if t.start_time is None else 0,
+            t.start_time or time(23, 59),
+            t.priority,
+            t.id,
+        )
+    )
     return tasks
 
 def complete_task(task_id: int, actual_end: Optional[datetime] = None, db: Session = Depends(get_db)):
@@ -198,6 +188,21 @@ def delete_task(task_id: int, db: Session = Depends(get_db)):
     db.delete(db_task)
     db.commit()
     return {"detail": "Task deleted successfully"}
+
+
+def clear_today_tasks(db: Session = Depends(get_db)):
+    today = date.today()
+    deleted_count = (
+        db.query(Task)
+        .filter(Task.date == today)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {
+        "date": today.isoformat(),
+        "deleted_count": int(deleted_count),
+        "detail": "Today's tasks cleared successfully",
+    }
 
 def reschedule_overdue_tasks(db: Session = Depends(get_db)):
     overdue_tasks = get_overdue_tasks(db)

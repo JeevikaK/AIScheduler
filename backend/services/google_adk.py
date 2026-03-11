@@ -28,7 +28,7 @@ import os
 import openai
 
 class OpenAIClient:
-    def __init__(self, model_name="gpt-4o-mini"):
+    def __init__(self, model_name="gpt-4.1-mini"):
         api_key = os.environ.get("OPENAI_API_KEY")
         
         if not api_key:
