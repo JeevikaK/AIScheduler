@@ -1,4 +1,5 @@
 # AI Scheduler
+
 AI Scheduler is a FastAPI backend for planning daily tasks with an LLM-assisted chat interface.
 
 It combines:
