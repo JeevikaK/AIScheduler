@@ -2,28 +2,34 @@ AI-powered scheduler backend with chat-based daily planning.
 
 # AI Scheduler
 
-AI Scheduler is a FastAPI backend for planning daily tasks with an LLM-assisted chat interface.
+AI Scheduler is a FastAPI backend that turns natural language into structured, adaptive daily plans.
 
-It combines:
-- task CRUD APIs
-- mood + reflection tracking
-- schedule generation and rebalancing
-- a conversational `/chat` endpoint that can create, update, and clarify plans
+Instead of manually managing tasks and time slots, you can describe your day in plain English — the system generates, updates, and rebalances your schedule dynamically.
 
-## What This Project Is
+---
 
-AI Scheduler is an intelligent planning backend that turns natural-language requests into actionable daily schedules.  
-Instead of manually creating every task and timeslot, you can describe your day in plain English and let the system generate, rebalance, and adapt your plan.
+## ✨ Key Features
 
-## Why This Is Relevant
+- 🧠 **Conversational planning** via `/chat`
+- 📅 **Automatic schedule generation & rebalancing**
+- ✅ **Full task lifecycle** (create, update, complete, delete)
+- 📊 **Mood + reflection tracking** for adaptive planning
+- 🔁 **Real-time plan adjustments** based on user input
 
-Most planners are static: they store tasks but do not reason about changing priorities, time conflicts, energy levels, or follow-up instructions.  
-This project is relevant because it combines:
-- conversational task planning
-- adaptive scheduling based on context
-- feedback loops from mood and reflection data
+---
 
-That makes it useful for students and professionals who need a schedule that can evolve throughout the day, not just a fixed to-do list.
+## 💡 Why This Matters
+
+Most planners are static — they store tasks but don’t *think*.
+
+AI Scheduler is different:
+- understands intent from natural language  
+- adapts to time conflicts and changing priorities  
+- incorporates feedback loops (mood + reflections)  
+
+This makes it useful for anyone who wants a schedule that evolves throughout the day — not just a fixed to-do list.
+
+---
 
 ## Project Structure
 
