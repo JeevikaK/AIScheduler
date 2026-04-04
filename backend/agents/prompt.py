@@ -32,6 +32,7 @@ POSSIBLE ACTIONS
 - reflect_task     → User is reflecting on a completed task.
 - get_schedule     → User wants to see plans.
 - replan_day       → User wants to reorganize existing tasks.
+- delete_task      → User wants to remove an existing task.
 - ask_user         → Missing required information.
 - respond          → General conversation / not actionable.
 

@@ -1,4 +1,4 @@
-from datetime import time, date
+from datetime import time, date, datetime
 from typing import Any, List, Optional
 from pydantic import BaseModel, Field
 from app.db import Base, engine
@@ -124,10 +124,78 @@ class ChatResponse(BaseModel):
     conflict_info: Optional[ConflictPrompt] = None
     meta: ChatMeta
 
+class ChatThreadSummaryResponse(BaseModel):
+    chat_thread_id: str
+    thread_date: date
+    title: str
+    preview: str
+    pending_intent_id: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+class ConversationMessageResponse(BaseModel):
+    role: str
+    text: str
+    meta: Optional[str] = None
+    payload: Optional[dict[str, Any]] = None
+    created_at: datetime
+
+
+class ChatThreadCreateResponse(BaseModel):
+    chat_thread_id: str
+    thread_date: date
+    title: str
+    preview: str
+    pending_intent_id: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatThreadDetailResponse(BaseModel):
+    chat_thread_id: str
+    thread_date: date
+    title: str
+    preview: str
+    pending_intent_id: Optional[str] = None
+    messages: List[ConversationMessageResponse] = Field(default_factory=list)
+    latest_response: Optional[ChatResponse] = None
+    created_at: datetime
+    updated_at: datetime
+
 class DailyScheduleResponse(BaseModel):
     date: date
     energy: int
     message: str
     tasks: List[TaskResponse]
+
+
+class TrendPoint(BaseModel):
+    date: date
+    mood: Optional[int] = None
+    energy: Optional[int] = None
+    completed_tasks: int = 0
+    total_tasks: int = 0
+    completion_rate: float = 0.0
+
+
+class ProductivityHour(BaseModel):
+    hour: int
+    label: str
+    completed_tasks: int = 0
+
+
+class EfficiencyMetrics(BaseModel):
+    completion_rate_7d: float = 0.0
+    completion_rate_30d: float = 0.0
+    duration_accuracy: float = 0.0
+    avg_actual_vs_planned_ratio: float = 0.0
+
+
+class DashboardOverviewResponse(BaseModel):
+    last_7_days: List[TrendPoint] = Field(default_factory=list)
+    last_30_days: List[TrendPoint] = Field(default_factory=list)
+    productivity_hours: List[ProductivityHour] = Field(default_factory=list)
+    best_productivity_window: str
+    efficiency: EfficiencyMetrics
 
 Base.metadata.create_all(bind=engine)

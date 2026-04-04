@@ -1,12 +1,11 @@
 from datetime import date, datetime, time, timedelta
 import re
 from typing import List, Tuple
-from dateparser.search import search_dates
-from requests import Session
+from sqlalchemy.orm import Session
 from app.models import DurationStats, Task
 
 WORK_START = time(9, 0)  # 9:00 AM
-WORK_END = time(21, 0)   # 9:00 PM
+WORK_END = time(23, 0)   # 11:00 PM
 DEFAULT_DURATION_MINUTES = 60  # default task duration
 TASK_BUFFER_MIN = 5
 
@@ -115,7 +114,7 @@ def optimize_day_schedule(
     return new_task.start_time, new_task.end_time
 
 def extract_date_from_text(text: str):
-    lower = (text or "").lower()
+    lower = (text or "").lower().strip()
     today = date.today()
 
     # Deterministic handling for common relative cues.
@@ -126,28 +125,77 @@ def extract_date_from_text(text: str):
     if "today" in lower or "tonight" in lower:
         return today
 
-    result = search_dates(
-        text,
-        settings={
-            'PREFER_DATES_FROM': 'future',
-            'RELATIVE_BASE': datetime.now(), # Use current time for better relative accuracy
-            'TIMEZONE': 'America/Los_Angeles',
-            'RETURN_AS_TIMEZONE_AWARE': False
-        }
-    )
+    weekday_map = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
 
-    if result:
-        # Prefer parsed entries that look like calendar dates over bare hour-only fragments.
-        parsed_date = None
-        for matched, parsed in result:
-            token = (matched or "").strip().lower()
-            if re.fullmatch(r"\d{1,2}", token):
-                continue
-            parsed_date = parsed
-            break
-        if parsed_date is None:
-            _, parsed_date = result[0]
-        return parsed_date.date()
+    for weekday, idx in weekday_map.items():
+        if re.search(rf"\bnext\s+{weekday}\b", lower):
+            days_ahead = (idx - today.weekday() + 7) % 7 or 7
+            return today + timedelta(days=days_ahead)
+        if re.search(rf"\bthis\s+{weekday}\b", lower) or re.search(rf"\b{weekday}\b", lower):
+            days_ahead = (idx - today.weekday() + 7) % 7
+            return today + timedelta(days=days_ahead)
+
+    iso_match = re.search(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", lower)
+    if iso_match:
+        try:
+            return date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+        except ValueError:
+            pass
+
+    slash_match = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", lower)
+    if slash_match:
+        month = int(slash_match.group(1))
+        day = int(slash_match.group(2))
+        year_raw = slash_match.group(3)
+        if year_raw:
+            year = int(year_raw)
+            if year < 100:
+                year += 2000
+        else:
+            year = today.year
+        try:
+            candidate = date(year, month, day)
+            if candidate < today and not year_raw:
+                candidate = date(year + 1, month, day)
+            return candidate
+        except ValueError:
+            pass
+
+    month_names = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    for prefix, month_num in month_names.items():
+        m = re.search(rf"\b{prefix}[a-z]*\.?\s+(\d{{1,2}})(?:,?\s*(\d{{4}}))?\b", lower)
+        if not m:
+            continue
+        day = int(m.group(1))
+        year = int(m.group(2) or today.year)
+        try:
+            candidate = date(year, month_num, day)
+            if candidate < today and not m.group(2):
+                candidate = date(year + 1, month_num, day)
+            return candidate
+        except ValueError:
+            continue
 
     return today
 

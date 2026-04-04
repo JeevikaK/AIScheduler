@@ -71,3 +71,17 @@ class ConversationThread(Base):
     pending_state_json = Column(String, nullable=True)         # JSON object
     updated_at = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    thread_key = Column(String, index=True, nullable=False)
+    thread_date = Column(Date, index=True, nullable=False)
+    chat_thread_id = Column(String, index=True, nullable=True)
+    role = Column(String, nullable=False)
+    message_text = Column(String, nullable=False)
+    meta_text = Column(String, nullable=True)
+    payload_json = Column(String, nullable=True)
+    created_at = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)

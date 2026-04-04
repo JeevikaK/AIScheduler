@@ -6,7 +6,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.models import ConversationThread, Mood, Task
+from app.models import ConversationMessage, ConversationThread, Mood, Task
 from app.schemas import (
     ChatMeta,
     ChatResponse,
@@ -120,6 +120,17 @@ def _looks_like_schedule_request(text: str) -> bool:
     )
 
 
+def _looks_like_delete_request(text: str, thread_state: dict | None) -> bool:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    if not re.search(r"\b(delete|remove|drop)\b", lower):
+        return False
+    if re.search(r"\b(task|event|meeting|class|reminder)\b", lower):
+        return True
+    return _has_thread_task_context(thread_state)
+
+
 def _infer_fallback_action(message: str, thread_state: dict | None) -> str | None:
     text = message or ""
     fallback_multi = split_tasks_from_message(text)
@@ -127,6 +138,8 @@ def _infer_fallback_action(message: str, thread_state: dict | None) -> str | Non
         return "get_schedule"
     if _looks_like_followup_instruction(text) and _has_thread_task_context(thread_state):
         return "replan_day"
+    if _looks_like_delete_request(text, thread_state):
+        return "delete_task"
     if _looks_like_fresh_plan_request(text, fallback_multi) or len(fallback_multi) >= 2:
         return "create_task"
     return None
@@ -352,6 +365,51 @@ def save_thread_state(db: Session, thread_key: str, payload: dict) -> None:
     rec.pending_state_json = _dump_json_obj(payload.get("pending_state"))
     rec.updated_at = datetime.utcnow()
     db.commit()
+
+
+def persist_chat_turn(
+    db: Session,
+    thread_key: str,
+    thread_date: date,
+    chat_thread_id: str | None,
+    user_message: str,
+    response: ChatResponse,
+) -> None:
+    if not user_message.strip():
+        return
+
+    user_row = ConversationMessage(
+        thread_key=thread_key,
+        thread_date=thread_date,
+        chat_thread_id=chat_thread_id,
+        role="user",
+        message_text=user_message,
+        meta_text=None,
+        payload_json=None,
+    )
+    assistant_row = ConversationMessage(
+        thread_key=thread_key,
+        thread_date=thread_date,
+        chat_thread_id=chat_thread_id,
+        role="assistant",
+        message_text=response.message,
+        meta_text=_summarize_response_for_log(response),
+        payload_json=json.dumps(response.model_dump(mode="json")),
+    )
+    db.add(user_row)
+    db.add(assistant_row)
+    db.commit()
+
+
+def _summarize_response_for_log(response: ChatResponse) -> str | None:
+    parts = []
+    if response.created_tasks:
+        parts.append(f"{len(response.created_tasks)} created")
+    if response.updated_tasks:
+        parts.append(f"{len(response.updated_tasks)} updated")
+    if response.unscheduled_tasks:
+        parts.append(f"{len(response.unscheduled_tasks)} unscheduled")
+    return " | ".join(parts) or None
 
 
 def _thread_summary_for_prompt(db: Session, thread_key: str, thread_state: dict) -> str:
@@ -755,7 +813,7 @@ def suggest_alternative_slots(
     limit: int = 3,
 ) -> list[dict]:
     day_start = datetime.combine(task_date, time(9, 0))
-    day_end = datetime.combine(task_date, time(21, 0))
+    day_end = datetime.combine(task_date, time(23, 0))
     now = datetime.now()
     today = now.date()
     if task_date < today:
@@ -951,7 +1009,7 @@ def _dynamic_time_options_for_draft(db: Session, draft: dict, limit: int = 3) ->
 
     out = []
     cur = base
-    while len(out) < limit and cur.time() <= time(21, 0):
+    while len(out) < limit and cur.time() <= time(23, 0):
         out.append(
             {
                 "id": f"fallback-{cur.strftime('%H%M')}",
@@ -1495,7 +1553,24 @@ def _normalize_task_draft(
         start_time_val = parse_time(start_time_str.strip())
     if isinstance(end_time_str, str) and end_time_str.strip():
         end_time_val = parse_time(end_time_str.strip())
-    if not start_time_val:
+    # If the text implies an end time (e.g. "until 5pm"), treat it as end_time even if
+    # the model supplied it as start_time.
+    end_match = re.search(
+        r"\b(?:till|until|end|ends?|ending|finish|finishes|by)\b.*?\b(?:at|by|to)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if end_match and not end_time_val:
+        end_time_val = _parse_clock_token(end_match.group(1))
+        if start_time_val and start_time_val == end_time_val:
+            start_time_val = None
+    # If the text includes an explicit range ("from 2 to 4"), honor it.
+    if not start_time_val and not end_time_val:
+        range_start, range_end = _extract_time_range(raw_text.lower())
+        if range_start and range_end:
+            start_time_val = range_start
+            end_time_val = range_end
+    if not start_time_val and not end_time_val:
         # Do not use full message for draft-time extraction; it can leak unrelated times.
         start_time_val = extract_time_from_text(
             f"{args.get('title') or ''} {args.get('description') or ''}"
@@ -1520,6 +1595,10 @@ def _normalize_task_draft(
             deadline_date=deadline_date,
         )
     duration_minutes = int(total_effort or 60)
+    if end_time_val and not start_time_val:
+        # If only end time is given, back-calc start using inferred duration.
+        start_dt = datetime.combine(task_date, end_time_val) - timedelta(minutes=duration_minutes)
+        start_time_val = start_dt.time()
     if start_time_val and not end_time_val:
         end_time_val = (datetime.combine(task_date, start_time_val) + timedelta(minutes=duration_minutes)).time()
 
@@ -1614,7 +1693,12 @@ def _parse_pending_action(message: str, pending_response: dict | None, pending_s
     if pending_response and isinstance(pending_response, dict):
         raw_action = pending_response.get("action")
         if isinstance(raw_action, str) and raw_action.strip():
-            return raw_action.strip()
+            raw_action = raw_action.strip()
+            if raw_action.isdigit() and pending_state:
+                choice_map = pending_state.get("choice_map") or {}
+                mapped = choice_map.get(raw_action)
+                if mapped:
+                    return mapped
         raw_value = pending_response.get("value")
         if isinstance(raw_value, str) and raw_value.strip() and pending_state:
             choice_map = pending_state.get("choice_map") or {}
@@ -1631,13 +1715,6 @@ def _parse_pending_action(message: str, pending_response: dict | None, pending_s
             mapped = choice_map.get(m.group(1))
             if mapped:
                 return mapped
-    if text == "cancel":
-        return "cancel"
-    if "you decide" in text:
-        return "choose_best"
-    m = re.search(r"choose[_\s-]*slot[:\s]+([0-9]{4}-[0-9]{2}-[0-9]{2}@[0-9:]{8})", text)
-    if m:
-        return f"choose_slot:{m.group(1)}"
     return None
 
 
@@ -1689,6 +1766,63 @@ def handle_pending_resolution(
             )
         draft = pending_state.get("draft") or {}
         field = pending_state.get("field")
+        if pending_state.get("mode") == "intent_choice":
+            selected = str(action_value).strip().lower()
+            if selected == "intent:get_schedule":
+                tasks = get_schedule(effective_thread_date, db)
+                save_thread_state(
+                    db,
+                    thread_key,
+                    {
+                        "thread_date": effective_thread_date,
+                        "chat_thread_id": chat_thread_id,
+                        "last_intent_type": "schedule",
+                        "last_user_message": message,
+                        "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                        "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                        "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                        "pending_intent_id": None,
+                        "pending_state_type": None,
+                        "pending_state": {},
+                    },
+                )
+                return _build_response(
+                    mode="schedule",
+                    message="Here is your schedule for the day.",
+                    unchanged_tasks=tasks,
+                    resolved_thread_key=thread_key,
+                    affected_dates={effective_thread_date},
+                )
+            if selected == "intent:cancel":
+                _clear_pending_state(
+                    db,
+                    thread_key=thread_key,
+                    thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    thread_state=thread_state,
+                    last_intent_type="cancel",
+                    last_user_message=message,
+                )
+                return _build_response(
+                    mode="schedule",
+                    message="Okay, canceled.",
+                    resolved_thread_key=thread_key,
+                )
+            prompt = _build_clarification_prompt(
+                intent_id=pending_intent_id,
+                field=field or "intent",
+                question=pending_state.get("question", "Choose an option."),
+                options=pending_state.get("options", []),
+                allow_free_text=False,
+            )
+            return _build_response(
+                mode="ask_user",
+                message="Please choose one of the numbered options.",
+                resolved_thread_key=thread_key,
+                requires_user_input=True,
+                pending_intent_id=pending_intent_id,
+                clarification=prompt,
+            )
         if pending_state.get("mode") == "multi_create":
             drafts = pending_state.get("drafts") or []
             pending_index = int(pending_state.get("pending_index") or 0)
@@ -1865,6 +1999,98 @@ def handle_pending_resolution(
                 chat_thread_id=chat_thread_id,
                 message=message,
                 drafts=drafts,
+            )
+        if pending_state.get("mode") == "delete":
+            candidate_ids = pending_state.get("candidate_task_ids") or []
+            if isinstance(action_value, str) and action_value.strip().lower() == "cancel":
+                _clear_pending_state(
+                    db,
+                    thread_key=thread_key,
+                    thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    thread_state=thread_state,
+                    last_intent_type="cancel",
+                    last_user_message=message,
+                )
+                return _build_response(
+                    mode="schedule",
+                    message="Okay, I canceled the deletion.",
+                    resolved_thread_key=thread_key,
+                )
+
+            chosen_id = None
+            if isinstance(action_value, str):
+                m = re.search(r"delete_task:([0-9]+)", action_value, flags=re.IGNORECASE)
+                if m:
+                    chosen_id = int(m.group(1))
+                elif action_value.isdigit():
+                    chosen_id = int(action_value)
+            if not chosen_id and len(candidate_ids) == 1:
+                chosen_id = int(candidate_ids[0])
+            if not chosen_id or (candidate_ids and chosen_id not in candidate_ids):
+                prompt = _build_clarification_prompt(
+                    intent_id=pending_intent_id,
+                    field="target_task",
+                    question=pending_state.get("question", "Which task should I delete?"),
+                    options=pending_state.get("options", []),
+                )
+                return _build_response(
+                    mode="ask_user",
+                    message="Please reply with the option number for the task you want to delete.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    clarification=prompt,
+                )
+
+            target = db.query(Task).filter(Task.id == chosen_id).first()
+            if not target:
+                _clear_pending_state(
+                    db,
+                    thread_key=thread_key,
+                    thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    thread_state=thread_state,
+                    last_intent_type="pending_invalid",
+                    last_user_message=message,
+                )
+                return _build_response(
+                    mode="schedule",
+                    message="That task no longer exists.",
+                    resolved_thread_key=thread_key,
+                    warnings=["Task chosen for deletion no longer exists."],
+                )
+
+            before_state = {
+                t.id: (t.date, t.start_time, t.end_time)
+                for t in db.query(Task).filter(Task.date == target.date, Task.completed == False).all()
+            }
+            db.delete(target)
+            db.commit()
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "delete",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": [],
+                    "last_referenced_task_ids": [chosen_id],
+                    "pending_intent_id": None,
+                    "pending_state_type": None,
+                    "pending_state": {},
+                },
+            )
+            updated = _collect_updated_tasks_for_dates(db, {target.date: before_state}, {target.date})
+            return _build_response(
+                mode="delete",
+                message=f"Deleted {target.title}.",
+                updated_tasks=updated,
+                resolved_thread_key=thread_key,
+                applied_after_confirmation=True,
+                affected_dates={target.date},
             )
         if pending_state.get("intent") == "replan":
             if isinstance(action_value, str) and action_value.strip().lower() == "cancel":
@@ -2225,10 +2451,10 @@ def handle_pending_resolution(
         )
 
     action = _parse_pending_action(message, pending_response, pending_state)
-    if action is None and confirm is False:
-        action = "cancel"
     if action is None and confirm is True:
         action = "choose_best"
+    if action is None and confirm is False:
+        action = "cancel"
 
     suggestions = pending_state.get("suggestions", [])
     conflicts = (
@@ -2267,12 +2493,22 @@ def handle_pending_resolution(
     if action in (None, ""):
         return _build_response(
             mode="conflict",
-            message="There is a scheduling conflict. Choose one of the suggested actions.",
+            message="There is a scheduling conflict. Please choose one of the numbered options.",
             resolved_thread_key=thread_key,
             requires_user_input=True,
             pending_intent_id=pending_intent_id,
             conflict_info=conflict_prompt,
             warnings=["Pending conflict resolution requires your choice."],
+        )
+
+    if action == "make_adjustments":
+        return _build_response(
+            mode="conflict",
+            message="Okay, let's adjust it. Please choose one of the numbered slot options.",
+            resolved_thread_key=thread_key,
+            requires_user_input=True,
+            pending_intent_id=pending_intent_id,
+            conflict_info=conflict_prompt,
         )
 
     if action == "cancel":
@@ -2291,7 +2527,141 @@ def handle_pending_resolution(
             resolved_thread_key=thread_key,
         )
 
-    if mode == "unscheduled_conflict":
+    if mode in ("unscheduled_conflict", "create_conflict_move_existing"):
+        if action == "keep_original_and_move_conflicts":
+            conflict_tasks = conflicts or []
+            if len(conflict_tasks) == 1:
+                chosen_task = conflict_tasks[0]
+                duration = task_duration_minutes(chosen_task)
+                suggestions = _suggest_slots_same_day_first(
+                    db=db,
+                    task_date=chosen_task.date,
+                    duration_min=duration,
+                    task_text=f"{chosen_task.title} {chosen_task.description}",
+                    limit=3,
+                )
+                if not suggestions:
+                    return _build_response(
+                        mode="conflict",
+                        message="I couldn't find any available slots. Please provide a time.",
+                        resolved_thread_key=thread_key,
+                        requires_user_input=True,
+                        pending_intent_id=pending_intent_id,
+                        conflict_info=conflict_prompt,
+                        warnings=["No available slots found for the conflicting task."],
+                    )
+
+                choice_pairs: list[tuple[str, str]] = []
+                for s in suggestions:
+                    choice_pairs.append((_format_slot_choice_label(s), f"choose_slot:{s['slot_id']}"))
+                choice_pairs.append(("Cancel", "cancel"))
+                choice_map = _build_choice_map(choice_pairs)
+                save_thread_state(
+                    db,
+                    thread_key,
+                    {
+                        "thread_date": effective_thread_date,
+                        "chat_thread_id": chat_thread_id,
+                        "last_intent_type": "conflict",
+                        "last_user_message": message,
+                        "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                        "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                        "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                        "pending_intent_id": pending_intent_id,
+                        "pending_state_type": "conflict_resolution",
+                        "pending_state": {
+                            "mode": "unscheduled_conflict",
+                            "phase": "choose_slot",
+                            "target_task_id": chosen_task.id,
+                            "unscheduled_task_id": pending_state.get("unscheduled_task_id"),
+                            "unscheduled_intended_start": pending_state.get("unscheduled_intended_start"),
+                            "unscheduled_intended_end": pending_state.get("unscheduled_intended_end"),
+                            "draft": {
+                                "title": chosen_task.title,
+                                "description": chosen_task.description,
+                                "date": chosen_task.date.isoformat(),
+                                "start_time": None,
+                                "end_time": None,
+                                "duration_minutes": duration,
+                                "priority": int(chosen_task.priority or 1),
+                            },
+                            "conflict_ids": pending_state.get("conflict_ids", []),
+                            "suggestions": [
+                                {
+                                    "slot_id": s["slot_id"],
+                                    "date": s["date"].isoformat(),
+                                    "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                    "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                    "score": float(s["score"]),
+                                    "reason": s["reason"],
+                                }
+                                for s in suggestions
+                            ],
+                            "choice_map": choice_map,
+                            "candidate_move_task_ids": [chosen_task.id],
+                        },
+                    },
+                )
+                return _build_response(
+                    mode="conflict",
+                    message=_format_choice_message(
+                        f"When should I move {chosen_task.title}?",
+                        choice_pairs,
+                    ),
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=_build_conflict_prompt(
+                        intent_id=pending_intent_id,
+                        draft={
+                            "title": chosen_task.title,
+                            "description": chosen_task.description,
+                            "date": chosen_task.date,
+                            "start_time": None,
+                            "end_time": None,
+                            "duration_minutes": duration,
+                            "priority": int(chosen_task.priority or 1),
+                        },
+                        conflicts=conflict_tasks,
+                        suggestions=suggestions,
+                        actions=["choose_slot:<slot_id>", "cancel"],
+                    ),
+                )
+
+            choice_pairs = [(_format_task_choice_label(task), f"choose_task:{task.id}") for task in conflict_tasks[:3]]
+            choice_pairs.append(("Cancel", "cancel"))
+            choice_map = _build_choice_map(choice_pairs)
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "conflict",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                    "pending_intent_id": pending_intent_id,
+                    "pending_state_type": "conflict_resolution",
+                    "pending_state": {
+                        "mode": mode,
+                        "phase": "choose_task",
+                        "candidate_move_task_ids": [task.id for task in conflict_tasks[:3]],
+                        "conflict_ids": pending_state.get("conflict_ids", []),
+                        "choice_map": choice_map,
+                    },
+                },
+            )
+            return _build_response(
+                mode="conflict",
+                message=_format_choice_message("Which task should I move?", choice_pairs),
+                resolved_thread_key=thread_key,
+                requires_user_input=True,
+                pending_intent_id=pending_intent_id,
+                conflict_info=conflict_prompt,
+            )
+
         phase = pending_state.get("phase") or "choose_task"
         candidate_ids = pending_state.get("candidate_move_task_ids") or []
         if phase == "choose_task":
@@ -2424,10 +2794,135 @@ def handle_pending_resolution(
                 ),
             )
 
-    if mode == "replan" and action == "keep_original_and_move_conflicts":
+    if action == "keep_original_and_move_conflicts" and mode in ("replan", "multi_create_conflict", "create_conflict"):
+        conflict_ids = pending_state.get("conflict_ids") or []
+        conflict_tasks = conflicts or []
+
+        if len(conflict_tasks) == 1:
+            task_to_move = conflict_tasks[0]
+            duration = task_duration_minutes(task_to_move)
+            suggestions = _suggest_slots_same_day_first(
+                db=db,
+                task_date=task_to_move.date,
+                duration_min=duration,
+                task_text=f"{task_to_move.title} {task_to_move.description}",
+                limit=3,
+            )
+            if not suggestions:
+                return _build_response(
+                    mode="conflict",
+                    message="I couldn't find any available slots. Please provide a time.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    pending_intent_id=pending_intent_id,
+                    conflict_info=conflict_prompt,
+                    warnings=["No available slots found for the conflicting task."],
+                )
+
+            choice_pairs: list[tuple[str, str]] = []
+            for s in suggestions:
+                choice_pairs.append((_format_slot_choice_label(s), f"choose_slot:{s['slot_id']}"))
+            choice_pairs.append(("Cancel", "cancel"))
+            choice_map = _build_choice_map(choice_pairs)
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "conflict",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                    "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                    "pending_intent_id": pending_intent_id,
+                    "pending_state_type": "conflict_resolution",
+                        "pending_state": {
+                            "mode": "create_conflict_move_existing" if mode == "create_conflict" else "unscheduled_conflict",
+                            "phase": "choose_slot",
+                            "target_task_id": task_to_move.id,
+                            "conflict_ids": conflict_ids,
+                            "candidate_move_task_ids": [task_to_move.id],
+                            "draft": {
+                            "title": task_to_move.title,
+                            "description": task_to_move.description,
+                            "date": task_to_move.date.isoformat(),
+                            "start_time": None,
+                            "end_time": None,
+                            "duration_minutes": duration,
+                            "priority": int(task_to_move.priority or 1),
+                        },
+                        "suggestions": [
+                            {
+                                "slot_id": s["slot_id"],
+                                "date": s["date"].isoformat(),
+                                "start_time": s["start_time"].strftime("%H:%M:%S"),
+                                "end_time": s["end_time"].strftime("%H:%M:%S"),
+                                "score": float(s["score"]),
+                                "reason": s["reason"],
+                            }
+                            for s in suggestions
+                        ],
+                        "choice_map": choice_map,
+                        "new_task_draft": pending_state.get("draft") if mode == "create_conflict" else None,
+                    },
+                },
+            )
+            return _build_response(
+                mode="conflict",
+                message=_format_choice_message(
+                    f"When should I move {task_to_move.title}?",
+                    choice_pairs,
+                ),
+                resolved_thread_key=thread_key,
+                requires_user_input=True,
+                pending_intent_id=pending_intent_id,
+                conflict_info=_build_conflict_prompt(
+                    intent_id=pending_intent_id,
+                    draft={
+                        "title": task_to_move.title,
+                        "description": task_to_move.description,
+                        "date": task_to_move.date,
+                        "start_time": None,
+                        "end_time": None,
+                        "duration_minutes": duration,
+                        "priority": int(task_to_move.priority or 1),
+                    },
+                    conflicts=conflict_tasks,
+                    suggestions=suggestions,
+                    actions=["choose_slot:<slot_id>", "cancel"],
+                ),
+            )
+
+        choice_pairs = [(_format_task_choice_label(task), f"choose_task:{task.id}") for task in conflict_tasks[:3]]
+        choice_pairs.append(("Cancel", "cancel"))
+        choice_map = _build_choice_map(choice_pairs)
+        save_thread_state(
+            db,
+            thread_key,
+            {
+                "thread_date": effective_thread_date,
+                "chat_thread_id": chat_thread_id,
+                "last_intent_type": "conflict",
+                "last_user_message": message,
+                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                "pending_intent_id": pending_intent_id,
+                "pending_state_type": "conflict_resolution",
+                    "pending_state": {
+                        "mode": "create_conflict_move_existing" if mode == "create_conflict" else "unscheduled_conflict",
+                        "phase": "choose_task",
+                        "candidate_move_task_ids": [task.id for task in conflict_tasks[:3]],
+                        "conflict_ids": conflict_ids,
+                        "choice_map": choice_map,
+                        "new_task_draft": pending_state.get("draft") if mode == "create_conflict" else None,
+                    },
+                },
+            )
         return _build_response(
             mode="conflict",
-            message="Please choose a slot or cancel.",
+            message=_format_choice_message("Which task should I move?", choice_pairs),
             resolved_thread_key=thread_key,
             requires_user_input=True,
             pending_intent_id=pending_intent_id,
@@ -2481,7 +2976,7 @@ def handle_pending_resolution(
             drafts=drafts,
         )
 
-    if mode == "unscheduled_conflict" and target_task_id:
+    if mode in ("unscheduled_conflict", "create_conflict_move_existing") and target_task_id:
         target = db.query(Task).filter(Task.id == int(target_task_id)).first()
         if not target:
             _clear_pending_state(
@@ -2516,6 +3011,50 @@ def handle_pending_resolution(
         updated = _collect_updated_tasks_for_dates(db, {draft_date: before_state}, {draft_date})
         updated = [t for t in updated if t.id == target.id]
 
+        created_tasks = []
+
+        if mode == "create_conflict_move_existing":
+            new_task_draft = pending_state.get("new_task_draft") or {}
+            new_task_date = datetime.strptime(new_task_draft["date"], "%Y-%m-%d").date()
+            new_task_start = parse_time(new_task_draft["start_time"]) if new_task_draft.get("start_time") else None
+            new_task_end = parse_time(new_task_draft["end_time"]) if new_task_draft.get("end_time") else None
+            if new_task_start and not new_task_end:
+                new_task_end = (
+                    datetime.combine(new_task_date, new_task_start)
+                    + timedelta(minutes=int(new_task_draft.get("duration_minutes") or 60))
+                ).time()
+
+            post_move_conflicts = []
+            if new_task_start and new_task_end:
+                for other in db.query(Task).filter(Task.date == new_task_date, Task.completed == False).all():
+                    c_s, c_e = _task_datetime_range(other)
+                    if not c_s or not c_e:
+                        continue
+                    n_s = datetime.combine(new_task_date, new_task_start)
+                    n_e = datetime.combine(new_task_date, new_task_end)
+                    if _slot_overlaps(n_s, n_e, c_s, c_e):
+                        post_move_conflicts.append(other)
+
+            if post_move_conflicts:
+                return _build_response(
+                    mode="conflict",
+                    message="I moved the conflicting task, but the new task still overlaps another task. Please resend this request so I can recompute the options cleanly.",
+                    resolved_thread_key=thread_key,
+                    warnings=["Post-move conflict remained while applying the new task."],
+                )
+
+            created = create_task(
+                db=db,
+                title=new_task_draft.get("title") or "Task",
+                description=new_task_draft.get("description") or "Task created after conflict resolution.",
+                date=new_task_date,
+                start_time=new_task_start,
+                end_time=new_task_end,
+                priority=int(new_task_draft.get("priority") or 1),
+                duration_minutes=int(new_task_draft.get("duration_minutes") or 60),
+            )
+            created_tasks = [created]
+
         unscheduled_id = pending_state.get("unscheduled_task_id")
         intended_start_raw = pending_state.get("unscheduled_intended_start")
         intended_end_raw = pending_state.get("unscheduled_intended_end")
@@ -2546,23 +3085,24 @@ def handle_pending_resolution(
             {
                 "thread_date": effective_thread_date,
                 "chat_thread_id": chat_thread_id,
-                "last_intent_type": "replan",
+                "last_intent_type": "create" if mode == "create_conflict_move_existing" else "replan",
                 "last_user_message": message,
-                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                "last_created_task_ids": [t.id for t in created_tasks][:10] if mode == "create_conflict_move_existing" else thread_state.get("last_created_task_ids", []),
                 "last_updated_task_ids": [target.id],
-                "last_referenced_task_ids": [target.id],
+                "last_referenced_task_ids": ([target.id] + [t.id for t in created_tasks][:9]) if mode == "create_conflict_move_existing" else [target.id],
                 "pending_intent_id": None,
                 "pending_state_type": None,
                 "pending_state": {},
             },
         )
         return _build_response(
-            mode="replan",
+            mode="create" if mode == "create_conflict_move_existing" else "replan",
             message="Updated task after resolving the conflict.",
+            created_tasks=created_tasks,
             updated_tasks=updated or [target],
             resolved_thread_key=thread_key,
             applied_after_confirmation=bool(choose_best),
-            affected_dates={draft_date},
+            affected_dates={draft_date} | ({created_tasks[0].date} if created_tasks else set()),
         )
 
     if mode == "replan" and target_task_id:
@@ -2704,6 +3244,7 @@ def _save_ask_user_pending_state(
     extra_pending_state: dict | None = None,
 ) -> str:
     pending_intent_id = str(uuid.uuid4())
+    auto_choice_map = {str(i + 1): str(opt.get("value") or opt.get("id") or "") for i, opt in enumerate(options_raw or [])}
     pending_state = {
         "field": field,
         "question": question,
@@ -2711,6 +3252,8 @@ def _save_ask_user_pending_state(
     }
     if extra_pending_state:
         pending_state.update(extra_pending_state)
+    if auto_choice_map and not pending_state.get("choice_map"):
+        pending_state["choice_map"] = auto_choice_map
     save_thread_state(
         db,
         thread_key,
@@ -2869,6 +3412,104 @@ def _build_replan_clarification_response(
     )
 
 
+def _build_delete_task_prompt(
+    message: str,
+    db: Session,
+    thread_key: str,
+    thread_state: dict,
+    effective_thread_date: date,
+    chat_thread_id: str | None,
+    candidate_tasks: list[Task],
+) -> ChatResponse:
+    question = "Which task should I delete?"
+    options_raw = [
+        {"id": str(idx + 1), "label": _format_task_choice_label(task), "value": f"delete_task:{task.id}"}
+        for idx, task in enumerate(candidate_tasks[:3])
+    ]
+    options_raw.append({"id": str(len(options_raw) + 1), "label": "Cancel", "value": "cancel"})
+    choice_map = _build_choice_map([(opt["label"], opt["value"]) for opt in options_raw])
+    pending_intent_id = _save_ask_user_pending_state(
+        db=db,
+        thread_key=thread_key,
+        thread_state=thread_state,
+        effective_thread_date=effective_thread_date,
+        chat_thread_id=chat_thread_id,
+        message=message,
+        field="target_task",
+        question=question,
+        options_raw=options_raw,
+        extra_pending_state={
+            "mode": "delete",
+            "candidate_task_ids": [task.id for task in candidate_tasks[:3]],
+            "choice_map": choice_map,
+        },
+    )
+    return _build_ask_user_response(
+        thread_key,
+        pending_intent_id,
+        "target_task",
+        question,
+        options_raw,
+        used_replan_handler=False,
+        allow_free_text=False,
+    )
+
+
+def _find_delete_candidates(
+    db: Session,
+    message: str,
+    thread_state: dict,
+    reference_date: date,
+    limit: int = 3,
+) -> list[Task]:
+    text = (message or "").lower()
+    candidate_pool = (
+        db.query(Task)
+        .filter(Task.date >= reference_date, Task.completed == False)
+        .order_by(Task.date.asc(), Task.start_time.asc(), Task.priority.desc(), Task.id.asc())
+        .all()
+    )
+    memory_ids = []
+    for tid in (
+        thread_state.get("last_referenced_task_ids", [])
+        + thread_state.get("last_updated_task_ids", [])
+        + thread_state.get("last_created_task_ids", [])
+    ):
+        try:
+            tid_int = int(tid)
+        except (TypeError, ValueError):
+            continue
+        if tid_int not in memory_ids:
+            memory_ids.append(tid_int)
+    if memory_ids:
+        memory_rows = db.query(Task).filter(Task.id.in_(memory_ids), Task.completed == False).all()
+        by_id = {t.id: t for t in memory_rows}
+        candidate_pool = list({t.id: t for t in candidate_pool + [by_id[i] for i in memory_ids if i in by_id]}.values())
+
+    def _tokenize(s: str) -> set[str]:
+        tokens = set()
+        for w in re.findall(r"[a-z0-9]+", (s or "").lower()):
+            if len(w) <= 1 or w in STOP_WORDS:
+                continue
+            tokens.add(w)
+        return tokens
+
+    query_tokens = _tokenize(text)
+    scored = []
+    for task in candidate_pool:
+        task_tokens = _tokenize(f"{task.title or ''} {task.description or ''}")
+        overlap = len(query_tokens.intersection(task_tokens))
+        if overlap == 0 and not query_tokens:
+            overlap = 1 if task.id in memory_ids else 0
+        if overlap == 0:
+            continue
+        scored.append((overlap, task))
+    if not scored:
+        return candidate_pool[:limit]
+    scored.sort(key=lambda item: (-item[0], item[1].date, item[1].start_time or time(23, 59), -item[1].priority, item[1].id))
+    return [task for _score, task in scored[:limit]]
+
+
 def _build_unscheduled_conflict_prompt(
     unscheduled_task: Task,
     conflicts: list[Task],
@@ -2928,7 +3569,7 @@ def _build_multi_create_prompt(
         if not suggestions and min_start:
             task_date = datetime.strptime(draft["date"], "%Y-%m-%d").date()
             cur = datetime.combine(task_date, min_start)
-            end_dt = datetime.combine(task_date, time(21, 0))
+            end_dt = datetime.combine(task_date, time(23, 0))
             while len(suggestions) < 3 and cur + timedelta(minutes=int(draft.get("duration_minutes") or 60)) <= end_dt:
                 suggestions.append(
                     {
@@ -3335,7 +3976,69 @@ def _handle_non_create_decision(
             False,
         )
 
+    if decision.action == "delete_task":
+        candidate_tasks = _find_delete_candidates(
+            db=db,
+            message=message,
+            thread_state=thread_state,
+            reference_date=effective_thread_date,
+            limit=3,
+        )
+        if not candidate_tasks:
+            return (
+                _build_response(
+                    mode="ask_user",
+                    message="I couldn't find a matching task to delete.",
+                    resolved_thread_key=thread_key,
+                    requires_user_input=True,
+                    clarification=_build_clarification_prompt(
+                        intent_id=str(uuid.uuid4()),
+                        field="target_task",
+                        question="Which task should I delete?",
+                        options=[],
+                    ),
+                    warnings=["No task candidates were found for deletion."],
+                ),
+                [],
+                False,
+            )
+        return (
+            _build_delete_task_prompt(
+                message=message,
+                db=db,
+                thread_key=thread_key,
+                thread_state=thread_state,
+                effective_thread_date=effective_thread_date,
+                chat_thread_id=chat_thread_id,
+                candidate_tasks=candidate_tasks,
+            ),
+            [],
+            False,
+        )
+
     inferred_action = _infer_fallback_action(message, thread_state)
+    if inferred_action == "delete_task":
+        candidate_tasks = _find_delete_candidates(
+            db=db,
+            message=message,
+            thread_state=thread_state,
+            reference_date=effective_thread_date,
+            limit=3,
+        )
+        if candidate_tasks:
+            return (
+                _build_delete_task_prompt(
+                    message=message,
+                    db=db,
+                    thread_key=thread_key,
+                    thread_state=thread_state,
+                    effective_thread_date=effective_thread_date,
+                    chat_thread_id=chat_thread_id,
+                    candidate_tasks=candidate_tasks,
+                ),
+                [],
+                False,
+            )
     inferred_label = {
         "replan_day": "replan",
         "get_schedule": "show your schedule",
@@ -3368,21 +4071,38 @@ def _handle_non_create_decision(
     else:
         question = f"I infer you want me to {inferred_label}. Is that correct?"
     options_raw = [
-        {"id": "yes", "label": "Yes", "value": "yes"},
-        {"id": "no", "label": "No", "value": "no"},
-        {"id": "corrections", "label": "Make Corrections", "value": "make corrections"},
+        {"id": "1", "label": "Get today's schedule", "value": "intent:get_schedule"},
+        {"id": "2", "label": "Cancel", "value": "intent:cancel"},
     ]
+    choice_map = _build_choice_map([(opt["label"], opt["value"]) for opt in options_raw])
+    pending_intent_id = _save_ask_user_pending_state(
+        db=db,
+        thread_key=thread_key,
+        thread_state=thread_state,
+        effective_thread_date=effective_thread_date,
+        chat_thread_id=chat_thread_id,
+        message=message,
+        field="intent",
+        question=question,
+        options_raw=options_raw,
+        extra_pending_state={
+            "mode": "intent_choice",
+            "choice_map": choice_map,
+        },
+    )
     return (
         _build_response(
             mode="ask_user",
             message=question,
             resolved_thread_key=thread_key,
             requires_user_input=True,
+            pending_intent_id=pending_intent_id,
             clarification=_build_clarification_prompt(
-                intent_id=str(uuid.uuid4()),
+                intent_id=pending_intent_id,
                 field="intent",
                 question=question,
                 options=options_raw,
+                allow_free_text=False,
             ),
         ),
         [],
@@ -3445,6 +4165,7 @@ def _maybe_return_interactive_create_gate(
             choice_pairs.append(("Cancel", "cancel"))
             choice_map = _build_choice_map(choice_pairs)
             pending_state = {
+                "mode": "create_conflict",
                 "draft": {
                     "title": draft["title"],
                     "description": draft["description"],
@@ -3587,7 +4308,15 @@ def _execute_create_args(
             draft=draft,
         )
         if interactive_gate:
-            return interactive_gate, created_tasks, affected_dates, pinned_task_ids_by_date, before_state_by_date
+            return (
+                interactive_gate,
+                created_tasks,
+                affected_dates,
+                pinned_task_ids_by_date,
+                before_state_by_date,
+                latest_end_by_task_id_by_date,
+                intended_times_by_task_id,
+            )
 
         raw_text = args.get("title") or args.get("description") or message
         text = title_from_text(raw_text)
@@ -3761,6 +4490,17 @@ def process_chat_request(
     thread_key = resolve_thread_key(chat_thread_id, effective_thread_date)
     thread_state = load_thread_state(db, thread_key)
 
+    def finalize(response: ChatResponse) -> ChatResponse:
+        persist_chat_turn(
+            db=db,
+            thread_key=thread_key,
+            thread_date=effective_thread_date,
+            chat_thread_id=chat_thread_id,
+            user_message=message,
+            response=response,
+        )
+        return response
+
     pending_result = handle_pending_resolution(
         message=message,
         pending_response=pending_response,
@@ -3772,7 +4512,7 @@ def process_chat_request(
         chat_thread_id=chat_thread_id,
     )
     if pending_result:
-        return pending_result
+        return finalize(pending_result)
 
     model_input = _build_model_input_for_decision(
         db=db,
@@ -3793,7 +4533,7 @@ def process_chat_request(
                 return_metadata=True,
                 dry_run=True,
             )
-            return _build_replan_clarification_response(
+            return finalize(_build_replan_clarification_response(
                 message=message,
                 db=db,
                 thread_key=thread_key,
@@ -3802,7 +4542,7 @@ def process_chat_request(
                 chat_thread_id=chat_thread_id,
                 meta=replan_meta,
                 used_replan_handler=True,
-            )
+            ))
         args = decision.arguments if isinstance(decision.arguments, dict) else {}
         field = args.get("field") or "detail"
         question = args.get("question") or decision.message or "Please clarify so I can continue."
@@ -3818,7 +4558,7 @@ def process_chat_request(
             question=question,
             options_raw=options_raw,
         )
-        return _build_ask_user_response(thread_key, pending_intent_id, field, question, options_raw)
+        return finalize(_build_ask_user_response(thread_key, pending_intent_id, field, question, options_raw))
 
     non_create_response, fallback_from_non_create, used_fallback_from_non_create = _handle_non_create_decision(
         message=message,
@@ -3830,7 +4570,7 @@ def process_chat_request(
         chat_thread_id=chat_thread_id,
     )
     if non_create_response:
-        return non_create_response
+        return finalize(non_create_response)
 
     args_list, used_fallback_parser = _normalize_args_list(decision, message)
     if used_fallback_from_non_create:
@@ -3839,12 +4579,12 @@ def process_chat_request(
 
     if decision.action == "create_task" and not args_list:
         # Per user request: do not ask generic clarification for create_task.
-        return _build_response(
+        return finalize(_build_response(
             mode="create",
             message="No tasks were created because no task details were found.",
             resolved_thread_key=thread_key,
             warnings=["No task details found in the request."],
-        )
+        ))
 
     if decision.action == "create_task" and len(args_list) > 1:
         drafts: list[dict] = []
@@ -3898,9 +4638,9 @@ def process_chat_request(
         thread_state=thread_state,
         effective_thread_date=effective_thread_date,
         chat_thread_id=chat_thread_id,
-    )
+        )
     if interactive_response:
-        return interactive_response
+        return finalize(interactive_response)
 
     # If any created task with an explicit time conflicts with existing tasks, ask before moving anything.
     for d in affected_dates:
@@ -3929,10 +4669,6 @@ def process_chat_request(
                 if _slot_overlaps(s, e, o_s, o_e):
                     conflicts.append(other)
             if conflicts:
-                # Clear the conflicting task's time so it doesn't overlap until resolved.
-                t.start_time = None
-                t.end_time = None
-                db.commit()
                 pending_intent_id = str(uuid.uuid4())
                 conflict_prompt = _build_unscheduled_conflict_prompt(t, conflicts, pending_intent_id)
                 choice_tasks = [t] + conflicts
@@ -3963,8 +4699,8 @@ def process_chat_request(
                                 "title": t.title,
                                 "description": t.description,
                                 "date": d.isoformat(),
-                                "start_time": None,
-                                "end_time": None,
+                                "start_time": start_t.strftime("%H:%M:%S"),
+                                "end_time": end_t.strftime("%H:%M:%S"),
                                 "duration_minutes": task_duration_minutes(t),
                                 "priority": int(t.priority or 1),
                             },
@@ -3974,7 +4710,7 @@ def process_chat_request(
                     },
                 )
                 conflict_titles = ", ".join([c.title for c in conflicts])
-                return _build_response(
+                return finalize(_build_response(
                     mode="conflict",
                     message=_format_choice_message(
                         f"Task {t.title} couldn't be scheduled because it conflicts with {conflict_titles}. Which task should I move?",
@@ -3985,7 +4721,7 @@ def process_chat_request(
                     pending_intent_id=pending_intent_id,
                     conflict_info=conflict_prompt,
                     affected_dates=affected_dates,
-                )
+                ))
 
     existing_pinned_by_date = {d: set(before_state_by_date.get(d, {}).keys()) for d in affected_dates}
     for d in affected_dates:
@@ -4037,7 +4773,7 @@ def process_chat_request(
         },
     )
 
-    return _build_response(
+    return finalize(_build_response(
         mode="create",
         message="Created and scheduled tasks.",
         created_tasks=created_tasks,
@@ -4046,4 +4782,4 @@ def process_chat_request(
         resolved_thread_key=thread_key,
         memory_used=False,
         affected_dates=affected_dates,
-    )
+    ))

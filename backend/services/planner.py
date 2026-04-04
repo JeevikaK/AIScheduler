@@ -8,6 +8,8 @@ import app
 from datetime import date, datetime, timedelta, time
 from sqlalchemy.orm import Session
 
+WORK_END = time(23, 0)
+
 def compute_adjustment_factor(task: Task, reflection: Reflection, mood: Mood):
     """
     Returns a multiplier for future duration estimates.
@@ -180,7 +182,7 @@ def rebalance_day(db, task_date, flexible_tasks=None, start_after=None, pinned_t
     del flexible_tasks, start_after  # Backward-compat args; scheduling is id-driven.
 
     work_start = time(9, 0)
-    work_end = time(21, 0)
+    work_end = WORK_END
     buffer_min = 5
     pinned_ids = set(pinned_task_ids or set())
     mood = db.query(Mood).filter(Mood.date == task_date).first()

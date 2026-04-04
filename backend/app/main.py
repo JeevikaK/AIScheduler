@@ -1,17 +1,21 @@
 from agents.scheduler_agent import scheduler_agent
 from fastapi import FastAPI, Depends, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
 from datetime import date, datetime
+from pathlib import Path
 from sqlalchemy.orm import Session
 from app.db import get_db
-from app.schemas import ChatInput, ChatResponse, DailyScheduleResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
-from services.tools import create_mood, create_reflection, create_task, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, reflect_on_task, delete_task, clear_today_tasks, reschedule_overdue_tasks, get_summary
+from app.schemas import ChatInput, ChatResponse, ChatThreadCreateResponse, ChatThreadDetailResponse, ChatThreadSummaryResponse, DailyScheduleResponse, DashboardOverviewResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
+from services.tools import create_chat_thread, create_mood, create_reflection, create_task, delete_chat_thread, get_chat_thread_detail, get_chat_threads, get_dashboard_overview, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, reflect_on_task, delete_task, clear_today_tasks, reschedule_overdue_tasks, get_summary
 from services.chat_helpers import (
     process_chat_request,
 )
 
 app = FastAPI(title="AI Life Planner")
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,9 +24,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/")
+def serve_frontend():
+    return FileResponse(STATIC_DIR / "index.html")
 
 @app.post("/tasks", response_model=TaskResponse)
 def create_task_endpoint(
@@ -77,6 +89,22 @@ def chat_create_task_endpoint(
         confirm=input.confirm,
     )
 
+@app.get("/chat/threads", response_model=List[ChatThreadSummaryResponse])
+def get_chat_threads_endpoint(thread_date: date = Query(...), db: Session = Depends(get_db)):
+    return get_chat_threads(thread_date, db)
+
+@app.post("/chat/threads", response_model=ChatThreadCreateResponse)
+def create_chat_thread_endpoint(thread_date: date = Query(...), db: Session = Depends(get_db)):
+    return create_chat_thread(thread_date, db)
+
+@app.get("/chat/threads/{chat_thread_id}", response_model=ChatThreadDetailResponse)
+def get_chat_thread_detail_endpoint(chat_thread_id: str, thread_date: date = Query(...), db: Session = Depends(get_db)):
+    return get_chat_thread_detail(thread_date, chat_thread_id, db)
+
+@app.delete("/chat/threads/{chat_thread_id}")
+def delete_chat_thread_endpoint(chat_thread_id: str, thread_date: date = Query(...), db: Session = Depends(get_db)):
+    return delete_chat_thread(thread_date, chat_thread_id, db)
+
 @app.get("/tasks", response_model=List[TaskResponse])
 def get_tasks_endpoint(task_date: date, db: Session = Depends(get_db)):
     return get_tasks(task_date, db)
@@ -126,3 +154,8 @@ def reschedule_overdue_tasks_endpoint(db: Session = Depends(get_db)):
 @app.get("/summary")
 def get_summary_endpoint(summary_date: date = Query(...), db: Session = Depends(get_db)):
     return get_summary(summary_date, db)
+
+
+@app.get("/dashboard/overview", response_model=DashboardOverviewResponse)
+def get_dashboard_overview_endpoint(db: Session = Depends(get_db)):
+    return get_dashboard_overview(db)
