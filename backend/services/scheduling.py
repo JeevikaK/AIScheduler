@@ -184,7 +184,10 @@ def extract_date_from_text(text: str):
         "dec": 12,
     }
     for prefix, month_num in month_names.items():
-        m = re.search(rf"\b{prefix}[a-z]*\.?\s+(\d{{1,2}})(?:,?\s*(\d{{4}}))?\b", lower)
+        m = re.search(
+            rf"\b{prefix}[a-z]*\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s*(\d{{4}}))?\b",
+            lower,
+        )
         if not m:
             continue
         day = int(m.group(1))

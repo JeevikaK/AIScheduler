@@ -1769,12 +1769,13 @@ def handle_pending_resolution(
         if pending_state.get("mode") == "intent_choice":
             selected = str(action_value).strip().lower()
             if selected == "intent:get_schedule":
-                tasks = get_schedule(effective_thread_date, db)
+                requested_schedule_date = extract_date_from_text(message) if _has_explicit_date_cue(message) else effective_thread_date
+                tasks = get_schedule(requested_schedule_date, db)
                 save_thread_state(
                     db,
                     thread_key,
                     {
-                        "thread_date": effective_thread_date,
+                        "thread_date": requested_schedule_date,
                         "chat_thread_id": chat_thread_id,
                         "last_intent_type": "schedule",
                         "last_user_message": message,
@@ -1791,7 +1792,7 @@ def handle_pending_resolution(
                     message="Here is your schedule for the day.",
                     unchanged_tasks=tasks,
                     resolved_thread_key=thread_key,
-                    affected_dates={effective_thread_date},
+                    affected_dates={requested_schedule_date},
                 )
             if selected == "intent:cancel":
                 _clear_pending_state(
@@ -3782,12 +3783,13 @@ def _handle_non_create_decision(
         return None, fallback_multi, True
 
     if decision.action == "get_schedule":
-        tasks = get_schedule(effective_thread_date, db)
+        requested_schedule_date = extract_date_from_text(message) if _has_explicit_date_cue(message) else effective_thread_date
+        tasks = get_schedule(requested_schedule_date, db)
         save_thread_state(
             db,
             thread_key,
             {
-                "thread_date": effective_thread_date,
+                "thread_date": requested_schedule_date,
                 "chat_thread_id": chat_thread_id,
                 "last_intent_type": "schedule",
                 "last_user_message": message,
@@ -3803,7 +3805,7 @@ def _handle_non_create_decision(
                 unchanged_tasks=tasks,
                 resolved_thread_key=thread_key,
                 memory_used=False,
-                affected_dates={effective_thread_date},
+                affected_dates={requested_schedule_date},
             ),
             [],
             False,
