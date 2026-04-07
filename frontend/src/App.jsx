@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import AnimatedShaderBackground from "./components/ui/animated-shader-background.jsx";
 
 const ACTIVE_THREAD_STORAGE_KEY = "ai_scheduler_active_threads_v2";
 
@@ -449,6 +450,7 @@ export default function App() {
 
   return (
     <>
+      <AnimatedShaderBackground />
       <div className="workspace-shell">
         <header className="global-nav">
           <div className="global-nav-left">
