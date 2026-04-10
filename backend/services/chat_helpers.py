@@ -28,6 +28,112 @@ STOP_WORDS = {
 
 FOLLOWUP_VERBS = ("move", "change", "shift", "reschedul", "push", "postpone", "swap", "keep", "remove", "delete", "drop", "cancel")
 
+GENERIC_GREETING_PATTERNS = [
+    r"hi",
+    r"hiya",
+    r"hello",
+    r"hey",
+    r"hey there",
+    r"good morning",
+    r"good afternoon",
+    r"good evening",
+    r"yo",
+]
+
+GENERIC_WELLBEING_PATTERNS = [
+    r"how(?:\s+are)?\s+you(?:\s+doing)?(?:\s+today)?",
+    r"how(?:\s+have)?\s+you\s+been(?:\s+lately)?",
+    r"how\s+you\s+been(?:\s+lately)?",
+    r"how'?s it going",
+    r"whats up",
+    r"what'?s up",
+    r"how are things",
+    r"how'?s your day going",
+    r"how is your day going",
+    r"how are you feeling",
+    r"how you feeling",
+    r"how are things going",
+]
+
+GENERIC_THANKS_PATTERNS = [
+    r"thanks",
+    r"thank you",
+    r"thanks!",
+    r"thank you!",
+    r"thx",
+    r"ty",
+]
+
+GENERIC_ACK_PATTERNS = [
+    r"okay",
+    r"ok",
+    r"cool",
+    r"sounds good",
+    r"got it",
+    r"alright",
+    r"all right",
+    r"nice",
+    r"great",
+    r"awesome",
+    r"sure",
+]
+
+GENERIC_POSITIVE_PATTERNS = [
+    r"you make me happy",
+    r"youre the best",
+    r"you are the best",
+    r"i like talking to you",
+    r"i love talking to you",
+    r"youre amazing",
+    r"you are amazing",
+    r"youre great",
+    r"you are great",
+    r"youre so helpful",
+    r"you are so helpful",
+]
+
+POSITIVE_USER_TO_ASSISTANT_WORDS = {
+    "nice", "kind", "sweet", "amazing", "great", "helpful", "awesome", "lovely",
+    "wonderful", "cool", "smart", "thoughtful", "funny", "gentle", "patient",
+    "supportive", "good", "brilliant", "fantastic",
+}
+
+POSITIVE_USER_FEELING_WORDS = {
+    "happy", "better", "calm", "safe", "lighter", "good", "great", "okay", "ok", "seen",
+}
+
+GENERIC_STATUS_PATTERNS = [
+    r"(?:i am|im|ive been|i have been|feeling|i feel)\s+(?:really\s+|so\s+|kinda\s+|kind of\s+|a bit\s+|not\s+)?(?:bored|tired|sleepy|stressed|overwhelmed|drained|burnt out|burned out|anxious|sad|down|lonely|unmotivated|demotivated|restless|frazzled|busy|good|great|okay|ok|well)(?:\s+(?:today|lately|right now|these days|you know|honestly|tbh|though|man|at the moment))?",
+    r"i\s+do(?:\s*not|nt)\s+feel\s+(?:so\s+|very\s+|that\s+)?(?:good|well|great|okay|ok)",
+    r"(?:its|it is)\s+been\s+(?:a\s+)?(?:long|rough|busy|stressful|exhausting)\s+day(?:\s+(?:today|honestly|you know))?",
+    r"life\s+is\s+(?:a\s+bit\s+|kind of\s+|kinda\s+|so\s+)?(?:much|heavy|a lot)(?:\s+today)?",
+    r"(?:this|today)\s+(?:day\s+is|is)\s+(?:weird|strange|off|rough)",
+    r"i\s+feel\s+(?:meh|off|weird)",
+    r"i(?:m| am)\s+(?:really\s+|so\s+|very\s+)?(?:angry|mad|upset|frustrated|annoyed)(?:\s+(?:today|lately|right now|honestly|you know))?",
+    r"i\s+am\s+(?:really\s+|so\s+|very\s+)?(?:angry|mad|upset|frustrated|annoyed)(?:\s+(?:today|lately|right now|honestly|you know))?",
+    r"i(?:m| am)\s+(?:really\s+|so\s+|very\s+)?(?:sad|hurt|lonely|down)(?:\s+(?:today|lately|right now|honestly|you know))?",
+    r"i\s+am\s+(?:really\s+|so\s+|very\s+)?(?:sad|hurt|lonely|down)(?:\s+(?:today|lately|right now|honestly|you know))?",
+]
+
+GENERIC_CASUAL_CHAT_PATTERNS = [
+    r"tell me something interesting",
+    r"say something nice",
+    r"give me a quick pep talk",
+    r"im bored(?:\s+you know)?",
+    r"what are you up to",
+    r"whatre you up to",
+    r"you there",
+    r"can we chat",
+    r"lets chat",
+    r"let us chat",
+    r"can we just talk normally",
+    r"can we talk normally",
+    r"can we just talk",
+    r"can we talk",
+    r"talk to me normally",
+    r"talk normally",
+]
+
 
 def _looks_like_replan_mutation_request(text: str) -> bool:
     lower = (text or "").lower().strip()
@@ -136,13 +242,289 @@ def _infer_fallback_action(message: str, thread_state: dict | None) -> str | Non
     fallback_multi = split_tasks_from_message(text)
     if _looks_like_schedule_request(text):
         return "get_schedule"
-    if _looks_like_followup_instruction(text) and _has_thread_task_context(thread_state):
+    replan_request = _parse_replan_request(text)
+    has_named_task_target = bool(
+        re.search(
+            r"\b(dinner|lunch|breakfast|sleep|class|meeting|study|revision|gym|walk|call|mom|dad|workout|task|event|reminder)\b",
+            text.lower(),
+        )
+    )
+    if _looks_like_followup_instruction(text) and (
+        _has_thread_task_context(thread_state)
+        or replan_request.get("target_phrase")
+        or has_named_task_target
+    ):
         return "replan_day"
     if _looks_like_delete_request(text, thread_state):
         return "delete_task"
     if _looks_like_fresh_plan_request(text, fallback_multi) or len(fallback_multi) >= 2:
         return "create_task"
     return None
+
+
+def _normalize_generic_text(text: str) -> str:
+    lower = (text or "").lower().strip()
+    lower = re.sub(r"['’]", "", lower)
+    lower = re.sub(r"\bi m\b", "im", lower)
+    lower = re.sub(r"\byou re\b", "youre", lower)
+    lower = re.sub(r"\bwhat s\b", "whats", lower)
+    lower = re.sub(r"\bit s\b", "its", lower)
+    lower = re.sub(r"[^a-z0-9\s]", " ", lower)
+    lower = re.sub(r"\s+", " ", lower)
+    return lower
+
+
+def _normalize_generic_token(token: str) -> str:
+    if not token:
+        return token
+    normalized = re.sub(r"(.)\1{2,}", r"\1", token)
+    if re.fullmatch(r"he+y+", normalized):
+        return "hey"
+    if re.fullmatch(r"hi+i+", normalized):
+        return "hi"
+    if re.fullmatch(r"hello+o*", normalized):
+        return "hello"
+    return normalized
+
+
+def _normalize_generic_variants(text: str) -> list[str]:
+    normalized = _normalize_generic_text(text)
+    if not normalized:
+        return [""]
+    tokens = normalized.split()
+    collapsed = " ".join(_normalize_generic_token(token) for token in tokens)
+    variants = [normalized]
+    if collapsed != normalized:
+        variants.append(collapsed)
+    return variants
+
+
+def _looks_like_positive_message(normalized: str) -> bool:
+    if not normalized:
+        return False
+    tokens = set(normalized.split())
+    if any(_matches_any_pattern(normalized, [pattern]) for pattern in GENERIC_POSITIVE_PATTERNS):
+        return True
+    if ("youre" in tokens or ("you" in tokens and "are" in tokens)) and tokens.intersection(POSITIVE_USER_TO_ASSISTANT_WORDS):
+        return True
+    if normalized.startswith("you make me ") and tokens.intersection(POSITIVE_USER_FEELING_WORDS):
+        return True
+    if re.search(r"\bi\s+(?:really\s+|truly\s+|honestly\s+)?(?:like|love|appreciate|adore)\s+you\b", normalized):
+        return True
+    return False
+
+
+def _looks_like_single_task_request(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    if re.search(r"\b(can|could|would)\s+we\s+(just\s+)?talk\b", lower):
+        return False
+    if re.search(r"\btalk(?:\s+to\s+me)?\s+normally\b", lower):
+        return False
+    if re.search(r"\b(can|could|would)\s+we\s+chat\b", lower):
+        return False
+    if _extract_time_range(lower)[0] or extract_time_from_text(lower):
+        return True
+    if re.search(r"\b\d+\s*(hour|hours|hr|hrs|min|mins|minute|minutes)\b", lower):
+        return True
+    return bool(
+        re.search(
+            r"\b(go|eat|cook|study|work|rest|sleep|talk|call|meet|attend|exercise|walk|code|coding|practice|read|write|buy|shop|clean|review|organize|plan|schedule)\b",
+            lower,
+        )
+    )
+
+
+def _matches_any_pattern(text: str, patterns: list[str]) -> bool:
+    return any(re.fullmatch(pattern, text) for pattern in patterns)
+
+
+def _pick_generic_reply(options: list[str], variant_seed: int) -> str:
+    if not options:
+        return ""
+    return options[variant_seed % len(options)]
+
+
+def _generic_reply_variant_seed(db: Session, thread_key: str) -> int:
+    return (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.thread_key == thread_key, ConversationMessage.role == "assistant")
+        .count()
+    )
+
+
+def _classify_generic_conversation(text: str, thread_state: dict | None) -> str | None:
+    normalized_variants = _normalize_generic_variants(text)
+    normalized = normalized_variants[0]
+    if not normalized:
+        return "fallback"
+
+    # Let clearly actionable or follow-up scheduling requests continue through normal intent handling.
+    if _infer_fallback_action(text, thread_state):
+        return None
+    if _looks_like_followup_instruction(text):
+        return None
+    if _looks_like_delete_request(text, thread_state):
+        return None
+    if _looks_like_schedule_request(text):
+        return None
+    if _looks_like_single_task_request(text):
+        return None
+
+    if any(_matches_any_pattern(variant, GENERIC_GREETING_PATTERNS) for variant in normalized_variants):
+        return "greeting"
+    if any(_matches_any_pattern(variant, GENERIC_WELLBEING_PATTERNS) for variant in normalized_variants):
+        return "wellbeing"
+    if any(_matches_any_pattern(variant, GENERIC_THANKS_PATTERNS) for variant in normalized_variants):
+        return "thanks"
+    if any(_looks_like_positive_message(variant) for variant in normalized_variants):
+        return "positive"
+    if any(_matches_any_pattern(variant, GENERIC_ACK_PATTERNS) for variant in normalized_variants):
+        return "ack"
+    if any(_matches_any_pattern(variant, GENERIC_STATUS_PATTERNS) for variant in normalized_variants):
+        return "status"
+    if any(_matches_any_pattern(variant, GENERIC_CASUAL_CHAT_PATTERNS) for variant in normalized_variants):
+        return "casual"
+    if len(normalized.split()) <= 7 and normalized.endswith("?"):
+        return "casual"
+    if len(normalized.split()) <= 5:
+        return "fallback"
+    return None
+
+
+def _build_generic_conversation_reply(category: str | None, text: str | None = None, variant_seed: int = 0) -> str:
+    normalized = _normalize_generic_text(text or "")
+    if category == "greeting":
+        if "good morning" in normalized:
+            return _pick_generic_reply([
+                "Good morning. I'm glad to hear from you, and I'm ready to help. What would you like to get organized first today?",
+                "Good morning. I'm here with you and ready to help you get settled into the day. What would you like to plan or sort out first?",
+            ], variant_seed)
+        if "good evening" in normalized:
+            return _pick_generic_reply([
+                "Good evening. I'm here with you and ready to help however I can. What would you like to sort out or plan next?",
+                "Good evening. We can keep this simple and make the rest of the day easier. What would you like to organize next?",
+            ], variant_seed)
+        return _pick_generic_reply([
+            "Hi! It's good to hear from you. I'm here and ready to help you get things organized. What would you like to plan or rearrange today?",
+            "Hey. I'm here and ready to help however you want to use me. What would you like to organize or sort out today?",
+            "Hi there. Happy to help. If you'd like, we can turn whatever is on your mind into a simple plan for today.",
+        ], variant_seed)
+    if category == "wellbeing":
+        if "day" in normalized:
+            return _pick_generic_reply([
+                "My day is going smoothly, and I'm ready to help. I'm here and focused on whatever would make things easier for you next. Want me to help organize your schedule or sort out a task?",
+                "Things are going well on my side, and I'm ready to help. If you want, we can use that energy to organize what's next in your day.",
+            ], variant_seed)
+        if "feeling" in normalized:
+            return _pick_generic_reply([
+                "I'm doing well and staying focused. I'm here, present, and ready to help with whatever you need next. If you want, we can turn that into a simple plan for the rest of your day.",
+                "I'm feeling good and ready to help. I'm here with you, and we can keep things practical from here. Want to organize the next part of your day together?",
+            ], variant_seed)
+        return _pick_generic_reply([
+            "I'm doing well and ready to help. I'm focused and here for whatever you need next. Want me to help organize your schedule or adjust a task?",
+            "I'm doing well, and I'm ready when you are. If you'd like, I can help organize your schedule or make the next task feel clearer.",
+        ], variant_seed)
+    if category == "thanks":
+        return _pick_generic_reply([
+            "You're welcome. Happy to help. If you'd like, we can keep going and plan, reschedule, or review the rest of your day.",
+            "Anytime. I'm glad that helped. If you want, we can keep the momentum going and organize what comes next.",
+        ], variant_seed)
+    if category == "positive":
+        if "happy" in normalized:
+            return _pick_generic_reply([
+                "That’s really kind of you to say. I’m glad this is helping and that you feel good talking with me. If you want, we can carry that forward and organize the next part of your day together.",
+                "That means a lot. I’m really glad I can make things feel a little lighter for you. If you'd like, we can use that energy and turn it into a simple plan for what comes next.",
+            ], variant_seed)
+        if "feel better" in normalized or "appreciate" in normalized:
+            return _pick_generic_reply([
+                "That means a lot to hear. I'm really glad this feels helpful to you. If you'd like, we can build on that and organize the next part of your day together.",
+                "Thank you, I really appreciate that. I'm glad I can make things feel a little easier. If you want, I can help turn that into a simple plan for what comes next.",
+            ], variant_seed)
+        if "nice" in normalized or "kind" in normalized:
+            return _pick_generic_reply([
+                "That’s really kind of you to say. I’m glad this feels supportive. If you want, we can keep going and organize whatever comes next.",
+                "Thank you, that’s very kind. I’m happy to be here with you. If you'd like, I can help you sort out the next part of your day.",
+            ], variant_seed)
+        if "best" in normalized or "amazing" in normalized or "great" in normalized:
+            return _pick_generic_reply([
+                "That’s really sweet of you. I’m glad I’ve been helpful. If you want, I can keep that going and help you organize the next step in your day.",
+                "Thank you, that’s very kind. I’m happy to be useful to you. If you'd like, we can keep going and plan or sort out what comes next.",
+            ], variant_seed)
+        return _pick_generic_reply([
+            "That’s really kind of you to say. I’m glad this feels helpful. If you want, we can keep going and organize whatever comes next.",
+            "Thank you, that means a lot. I’m happy to be here with you. If you'd like, I can help turn that good momentum into a simple plan for the rest of the day.",
+        ], variant_seed)
+    if category == "ack":
+        return _pick_generic_reply([
+            "Sounds good. We can keep things simple from here. What would you like to organize next?",
+            "Got it. We can take it one step at a time from here. What would you like to plan or sort out next?",
+        ], variant_seed)
+    if category == "status":
+        if "bored" in normalized:
+            return _pick_generic_reply([
+                "That sounds dull, and it can make the day drag. Sometimes one small change helps more than trying to fix everything at once. If you'd like, I can help you line up one or two useful things to do next and turn them into a simple plan.",
+                "That kind of boredom can make the whole day feel sticky. We don't need to force a big reset. If you want, I can help you pick one or two small things and organize them into a simple next step.",
+            ], variant_seed)
+        if "dont feel so good" in normalized or "do not feel so good" in normalized:
+            return _pick_generic_reply([
+                "I'm sorry you're not feeling so good. Let's keep things light and manageable for now instead of piling more on. If you'd like, I can help you simplify the rest of your day and make a gentle plan from here.",
+                "I'm sorry you're feeling off. We can keep this gentle and not ask too much of you right now. If you'd like, I can help you scale the rest of the day down into something more manageable.",
+            ], variant_seed)
+        if any(word in normalized for word in ["overwhelmed", "stressed", "drained", "burnt out", "burned out", "frazzled"]):
+            return _pick_generic_reply([
+                "That sounds like a lot to carry right now. We don't need to solve everything at once. If you'd like, I can help you break the rest of the day into a couple of smaller, calmer next steps and organize them into a simple plan.",
+                "That sounds heavy. Let's not make the whole day your problem all at once. If you want, I can help you sort the next few hours into smaller, steadier steps.",
+            ], variant_seed)
+        if any(word in normalized for word in ["angry", "mad", "upset", "frustrated", "annoyed"]):
+            return _pick_generic_reply([
+                "That sounds really frustrating. It makes sense that you're feeling that way. If you'd like, I can help you slow things down and organize the next step without adding more pressure.",
+                "I'm sorry it's hitting like that. When you're angry or frustrated, even the next small step can feel harder than it should. If you want, I can help you sort out one calm, practical next move and turn it into a simple plan.",
+            ], variant_seed)
+        if any(word in normalized for word in ["sad", "hurt", "lonely", "down"]):
+            return _pick_generic_reply([
+                "I'm sorry you're feeling that way. That can make everything feel heavier than usual. If you'd like, I can help you make the rest of the day feel a little gentler and more manageable with a simple plan.",
+                "That sounds really hard. We can keep things soft and simple from here. If you want, I can help you organize one or two easy next steps for the rest of the day.",
+            ], variant_seed)
+        if any(word in normalized for word in ["meh", "weird", "off", "rough", "long day", "life is"]):
+            return _pick_generic_reply([
+                "That kind of day can throw everything a little off balance. We can keep it simple and steady from here. If you'd like, I can help you shape the next part of your day into something more manageable and organized.",
+                "That sounds like one of those off days. We can keep the bar low and just get you to the next useful step. If you'd like, I can help you organize what comes next.",
+            ], variant_seed)
+        return _pick_generic_reply([
+            "I'm sorry you're feeling that way. Let's keep things gentle and manageable from here. If you'd like, I can help you turn the rest of your day into a simple plan with just one or two easy next steps.",
+            "That sounds tough. We can slow things down and make the next step easier. If you'd like, I can help you organize the rest of the day in a lighter way.",
+        ], variant_seed)
+    if category == "casual":
+        if "talk" in normalized or "chat" in normalized:
+            return _pick_generic_reply([
+                "Yes, we can keep this more natural. I'm happy to talk in a normal way and still help when you want to shift back into planning. If you'd like, tell me what's on your mind, or I can help you organize the next part of your day.",
+                "Absolutely. We can talk more normally and keep this relaxed. And whenever you want, I can help turn the conversation into a plan or help organize what comes next.",
+            ], variant_seed)
+        if "you there" in normalized:
+            return _pick_generic_reply([
+                "Yep, I'm here. We can keep things light or make them practical, whichever helps more right now. If you want, I can help you sort out what to do next and organize the next part of your day.",
+                "I'm here. We can just talk for a moment, or we can make things useful and organized from here. Whatever feels more helpful right now works for me.",
+            ], variant_seed)
+        if "what are you up to" in normalized:
+            return _pick_generic_reply([
+                "I'm here and ready to help. Mostly I'm focused on whatever would make your day feel clearer or easier. If you want, we can chat for a moment and then organize the next step together.",
+                "I'm here, paying attention, and ready to help with whatever would make the day smoother. If you'd like, we can talk for a minute and then organize what comes next.",
+            ], variant_seed)
+        if "interesting" in normalized:
+            return _pick_generic_reply([
+                "Sure. One interesting thing is that even a tiny concrete plan can lower the mental load of a messy day more than people expect. If you'd like, I can help you turn that into one useful next step and build from there.",
+                "Sure. One interesting thing is that clarity usually comes after a small action, not before it. If you want, I can help you organize one next step and see where that leads.",
+            ], variant_seed)
+        return _pick_generic_reply([
+            "Absolutely. We can chat for a moment and still make things useful. Want me to help you organize the next part of your day or line up one small task?",
+            "Of course. We can keep this casual and still make it helpful. If you want, I can help you organize what comes next without making it feel heavy.",
+        ], variant_seed)
+    return _pick_generic_reply([
+        "I’m here with you. I can respond to quick questions like that and also help turn things into a plan. Want me to show your schedule or help rearrange something?",
+        "I’m here, and I can do both: talk things through a little and help you get organized. If you'd like, we can figure out one useful next step together.",
+    ], variant_seed)
 
 
 def _infer_replan_summary(message: str) -> tuple[str | None, str | None]:
@@ -4046,14 +4428,53 @@ def _handle_non_create_decision(
         "get_schedule": "show your schedule",
     }.get(inferred_action, "help with scheduling")
     if inferred_action == "replan_day":
-        _, replan_meta = handle_followup_replan(
+        replanned, replan_meta = handle_followup_replan(
             message,
             db,
             thread_state=thread_state,
             reference_date=effective_thread_date,
             return_metadata=True,
-            dry_run=True,
         )
+        if replanned:
+            referenced_ids = [t.id for t in replanned][:10]
+            affected_dates = {t.date for t in replanned}
+            all_day_tasks = []
+            for d in affected_dates:
+                all_day_tasks.extend(
+                    db.query(Task)
+                    .filter(Task.date == d, Task.completed == False)
+                    .order_by(Task.start_time.asc(), Task.priority.desc(), Task.id.asc())
+                    .all()
+                )
+            replanned_ids = {t.id for t in replanned}
+            unchanged = [t for t in all_day_tasks if t.id not in replanned_ids]
+            save_thread_state(
+                db,
+                thread_key,
+                {
+                    "thread_date": effective_thread_date,
+                    "chat_thread_id": chat_thread_id,
+                    "last_intent_type": "replan",
+                    "last_user_message": message,
+                    "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                    "last_updated_task_ids": referenced_ids,
+                    "last_referenced_task_ids": referenced_ids,
+                },
+            )
+            return (
+                _build_response(
+                    mode="replan",
+                    message="Updated existing tasks based on your follow-up request.",
+                    updated_tasks=replanned,
+                    unchanged_tasks=unchanged,
+                    used_replan_handler=True,
+                    resolved_thread_key=thread_key,
+                    memory_used=bool(replan_meta.get("memory_used")),
+                    affected_dates=affected_dates,
+                ),
+                [],
+                False,
+            )
         return (
             _build_replan_clarification_response(
                 message=message,
@@ -4515,6 +4936,33 @@ def process_chat_request(
     )
     if pending_result:
         return finalize(pending_result)
+
+    generic_category = _classify_generic_conversation(message, thread_state)
+    if generic_category:
+        variant_seed = _generic_reply_variant_seed(db, thread_key)
+        save_thread_state(
+            db,
+            thread_key,
+            {
+                "thread_date": effective_thread_date,
+                "chat_thread_id": chat_thread_id,
+                "last_intent_type": "respond",
+                "last_user_message": message,
+                "last_created_task_ids": thread_state.get("last_created_task_ids", []),
+                "last_updated_task_ids": thread_state.get("last_updated_task_ids", []),
+                "last_referenced_task_ids": thread_state.get("last_referenced_task_ids", []),
+                "pending_intent_id": None,
+                "pending_state_type": None,
+                "pending_state": {},
+            },
+        )
+        return finalize(
+            _build_response(
+                mode="respond",
+                message=_build_generic_conversation_reply(generic_category, message, variant_seed),
+                resolved_thread_key=thread_key,
+            )
+        )
 
     model_input = _build_model_input_for_decision(
         db=db,
