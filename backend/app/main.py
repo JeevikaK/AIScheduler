@@ -36,6 +36,13 @@ def health_check():
 def serve_frontend():
     return FileResponse(STATIC_DIR / "index.html")
 
+
+@app.get("/todayschats")
+@app.get("/recentactivities")
+@app.get("/insights")
+def serve_frontend_routes():
+    return FileResponse(STATIC_DIR / "index.html")
+
 @app.post("/tasks", response_model=TaskResponse)
 def create_task_endpoint(
     task: TaskCreate,

@@ -6,6 +6,7 @@ import uuid
 from app.db import get_db
 from services.planner import get_historical_avg_duration, get_overdue_tasks, infer_task_type, reschedule_task, update_duration_model
 from services.scheduling import extract_date_from_text, infer_duration_minutes
+from services.thread_storage import repair_thread_storage_consistency
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from app.models import ConversationMessage, Reflection, Task, Mood, ConversationThread
@@ -282,6 +283,7 @@ def get_summary(summary_date: date = Query(...), db: Session = Depends(get_db)):
 
 
 def get_chat_threads(thread_date: date, db: Session = Depends(get_db)):
+    repair_thread_storage_consistency(db)
     records = (
         db.query(ConversationThread)
         .filter(
@@ -343,6 +345,7 @@ def create_chat_thread(thread_date: date, db: Session = Depends(get_db)):
 
 
 def delete_chat_thread(thread_date: date, chat_thread_id: str, db: Session = Depends(get_db)):
+    repair_thread_storage_consistency(db)
     thread_key = f"{chat_thread_id}:{thread_date.isoformat()}"
     record = db.query(ConversationThread).filter(ConversationThread.thread_key == thread_key).first()
     if not record:
@@ -359,6 +362,7 @@ def delete_chat_thread(thread_date: date, chat_thread_id: str, db: Session = Dep
 
 
 def get_chat_thread_detail(thread_date: date, chat_thread_id: str, db: Session = Depends(get_db)):
+    repair_thread_storage_consistency(db)
     thread_key = f"{chat_thread_id}:{thread_date.isoformat()}"
     record = db.query(ConversationThread).filter(ConversationThread.thread_key == thread_key).first()
     if not record:

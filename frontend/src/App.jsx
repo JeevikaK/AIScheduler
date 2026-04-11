@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowUp,
+  FileUp,
+  ImageIcon,
+  MonitorIcon,
+  Shapes,
+  UserRound,
+} from "lucide-react";
 import AnimatedShaderBackground from "./components/ui/animated-shader-background.jsx";
 
 const ACTIVE_THREAD_STORAGE_KEY = "ai_scheduler_active_threads_v2";
@@ -6,13 +14,33 @@ const ACTIVE_THREAD_STORAGE_KEY = "ai_scheduler_active_threads_v2";
 const QUICK_ACTIONS = [
   {
     id: "see-schedule",
-    label: "See schedule",
+    icon: ImageIcon,
+    label: "Clone a Screenshot",
     template: "Show me my schedule for ",
   },
   {
     id: "replan-activity",
-    label: "Replan activity",
+    icon: Shapes,
+    label: "Import from Figma",
     template: "Replan ",
+  },
+  {
+    id: "upload-project",
+    icon: FileUp,
+    label: "Upload a Project",
+    template: "Create a plan for ",
+  },
+  {
+    id: "landing-page",
+    icon: MonitorIcon,
+    label: "Landing Page",
+    template: "Help me plan ",
+  },
+  {
+    id: "sign-up-form",
+    icon: UserRound,
+    label: "Sign Up Form",
+    template: "Help me organize ",
   },
 ];
 
@@ -35,21 +63,38 @@ const INITIAL_SCHEDULE = {
   message: "No schedule loaded yet.",
 };
 
+const INITIAL_WEEK = {
+  startDate: todayIso(),
+  days: [],
+};
+
+const VIEW_TO_PATH = {
+  chat: "/todayschats",
+  insights: "/insights",
+  today: "/recentactivities",
+};
+
 export default function App() {
-  const searchParams = typeof window !== "undefined"
-    ? new URLSearchParams(window.location.search)
-    : null;
+  const initialLocation = typeof window !== "undefined" ? window.location : null;
+  const searchParams = initialLocation ? new URLSearchParams(initialLocation.search) : null;
+  const viewOverride = searchParams?.get("screen") || searchParams?.get("view") || null;
   const sidebarOverride = searchParams?.get("sidebar") || null;
   const sidebarSectionOverride = searchParams?.get("sidebarSection") || null;
-  const [view, setView] = useState("chat");
+  const initialView = viewOverride || getViewFromPath(initialLocation?.pathname || "/");
+  const [view, setView] = useState(initialView);
   const [threadDate] = useState(todayIso());
+  const [calendarWeekStart, setCalendarWeekStart] = useState(getWeekRange(todayIso())[0]);
+  const [activeThreadDate, setActiveThreadDate] = useState(todayIso());
   const [threadId, setThreadId] = useState(null);
   const [threads, setThreads] = useState([]);
+  const [recentThreads, setRecentThreads] = useState([]);
   const [messages, setMessages] = useState([]);
   const [options, setOptions] = useState([]);
   const [optionsAllowFreeText, setOptionsAllowFreeText] = useState(true);
   const [pendingIntentId, setPendingIntentId] = useState(null);
   const [scheduleToday, setScheduleToday] = useState(INITIAL_SCHEDULE);
+  const [weekSchedule, setWeekSchedule] = useState(INITIAL_WEEK);
+  const [selectedCalendarEventId, setSelectedCalendarEventId] = useState(null);
   const [insights, setInsights] = useState(INITIAL_INSIGHTS);
   const [chatInput, setChatInput] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -62,24 +107,68 @@ export default function App() {
   const [openSidebarSection, setOpenSidebarSection] = useState(
     sidebarOverride === "collapsed" ? null : (sidebarSectionOverride || "upcoming"),
   );
+  const forceNonChatInitialView = Boolean(viewOverride && viewOverride !== "chat");
 
   const chatMessagesRef = useRef(null);
   const inputRef = useRef(null);
   const upcomingSectionRef = useRef(null);
   const threadsSectionRef = useRef(null);
   const threadIdRef = useRef(null);
+  const activeThreadDateRef = useRef(todayIso());
   const threadsRef = useRef([]);
   const messagesRef = useRef([]);
   const threadsAvailableRef = useRef(true);
+  const homeTextareaRef = useRef(null);
 
   const hasConversation = messages.length > 0;
   const workspaceDate = formatWorkspaceDate(new Date());
   const upcomingTasks = getUpcomingTasks(scheduleToday.tasks || []).slice(0, 3);
+  const calendarDays = useMemo(() => (weekSchedule.days || []).slice(0, 6), [weekSchedule.days]);
+  const calendarTimeSlots = useMemo(() => getCalendarTimeSlots(calendarDays), [calendarDays]);
+  const scheduledCalendarEvents = useMemo(
+    () => buildCalendarEvents(calendarDays, calendarTimeSlots),
+    [calendarDays, calendarTimeSlots],
+  );
+  const selectedCalendarEvent = useMemo(
+    () => scheduledCalendarEvents.find((event) => event.id === selectedCalendarEventId) || scheduledCalendarEvents[0] || null,
+    [scheduledCalendarEvents, selectedCalendarEventId],
+  );
+
+  useEffect(() => {
+    if (!scheduledCalendarEvents.length) {
+      setSelectedCalendarEventId(null);
+      return;
+    }
+    if (!scheduledCalendarEvents.some((event) => event.id === selectedCalendarEventId)) {
+      setSelectedCalendarEventId(scheduledCalendarEvents[0].id);
+    }
+  }, [scheduledCalendarEvents, selectedCalendarEventId]);
 
   useEffect(() => {
     boot();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const handlePopState = () => {
+      const params = new URLSearchParams(window.location.search);
+      const override = params.get("screen") || params.get("view");
+      setView(override || getViewFromPath(window.location.pathname));
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const nextPath = VIEW_TO_PATH[view] || "/";
+    const currentUrl = `${window.location.pathname}${window.location.search}`;
+    const nextUrl = `${nextPath}${window.location.search}`;
+    if (currentUrl !== nextUrl) {
+      window.history.replaceState({}, "", nextUrl);
+    }
+  }, [view]);
 
   useEffect(() => {
     if (chatMessagesRef.current) {
@@ -90,6 +179,10 @@ export default function App() {
   useEffect(() => {
     threadIdRef.current = threadId;
   }, [threadId]);
+
+  useEffect(() => {
+    activeThreadDateRef.current = activeThreadDate;
+  }, [activeThreadDate]);
 
   useEffect(() => {
     threadsRef.current = threads;
@@ -103,10 +196,29 @@ export default function App() {
     threadsAvailableRef.current = threadsAvailable;
   }, [threadsAvailable]);
 
+  const adjustHomeTextareaHeight = useCallback((reset = false) => {
+    const textarea = homeTextareaRef.current;
+    if (!textarea) return;
+    const minHeight = 168;
+
+    if (reset) {
+      textarea.style.height = `${minHeight}px`;
+      return;
+    }
+
+    textarea.style.height = `${minHeight}px`;
+    const nextHeight = Math.max(minHeight, Math.min(textarea.scrollHeight, 240));
+    textarea.style.height = `${nextHeight}px`;
+  }, []);
+
+  useEffect(() => {
+    adjustHomeTextareaHeight();
+  }, [chatInput, adjustHomeTextareaHeight]);
+
   async function boot() {
-    await Promise.all([refreshInsights(), refreshTodaySchedule()]);
+    await Promise.all([refreshInsights(), refreshTodaySchedule(), refreshWeekSchedule(getWeekRange(todayIso())[0]), refreshRecentThreads()]);
     const targetThreadId = await refreshThreadCatalog({ preserveActive: false });
-    if (targetThreadId && messagesRef.current.length === 0) {
+    if (!viewOverride && targetThreadId && messagesRef.current.length === 0) {
       await activateThread(targetThreadId);
     }
   }
@@ -129,6 +241,31 @@ export default function App() {
     setScheduleToday(data);
   }
 
+  async function refreshWeekSchedule(baseWeekStart = calendarWeekStart) {
+    const range = getWeekRange(baseWeekStart);
+    const settled = await Promise.all(
+      range.map(async (day) => {
+        const items = await fetchJson(`/tasks?task_date=${day}`);
+        return {
+          date: day,
+          tasks: items.sort(compareTasksByTime),
+        };
+      }),
+    );
+
+    setWeekSchedule({
+      startDate: range[0],
+      days: settled,
+    });
+  }
+
+  async function navigateCalendarWeek(offset) {
+    const nextStart = addDays(calendarWeekStart, offset * 7);
+    setCalendarWeekStart(nextStart);
+    setSelectedCalendarEventId(null);
+    await refreshWeekSchedule(nextStart);
+  }
+
   async function refreshThreadCatalog({ preserveActive = true } = {}) {
     let items;
     try {
@@ -144,9 +281,10 @@ export default function App() {
     }
     const normalized = items.map(normalizeServerThread);
     setThreads(normalized);
+    await refreshRecentThreads();
 
     if (!normalized.length) {
-      const created = await createNewThread({ activate: true, replaceThreads: true });
+      const created = await createNewThread({ activate: !forceNonChatInitialView, replaceThreads: true });
       return created;
     }
 
@@ -162,17 +300,46 @@ export default function App() {
       return targetThreadId;
     }
 
-    await activateThread(targetThreadId, normalized);
+    if (!forceNonChatInitialView) {
+      await activateThread(targetThreadId, normalized);
+    }
     return targetThreadId;
   }
 
-  async function activateThread(targetThreadId, threadList = threadsRef.current) {
-    if (!targetThreadId) return;
-    if (!threadsAvailable) return;
-    const thread = threadList.find((item) => item.id === targetThreadId);
-    if (!thread) return;
+  async function refreshRecentThreads() {
+    if (!threadsAvailableRef.current) {
+      setRecentThreads([]);
+      return;
+    }
 
-    const detail = await fetchJson(`/chat/threads/${encodeURIComponent(targetThreadId)}?thread_date=${threadDate}`);
+    const dates = getRecentDateRange(threadDate, 6);
+    const settled = await Promise.allSettled(
+      dates.map(async (day) => {
+        const items = await fetchJson(`/chat/threads?thread_date=${day}`);
+        return {
+          date: day,
+          items: items.map(normalizeServerThread),
+        };
+      }),
+    );
+
+    const grouped = settled
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value)
+      .filter((group) => group.items.length > 0);
+
+    setRecentThreads(grouped);
+  }
+
+  async function activateThread(targetThreadId, threadList = threadsRef.current, requestedThreadDate = null) {
+    if (!targetThreadId) return;
+    if (!threadsAvailableRef.current) return;
+    const thread = threadList.find((item) => item.id === targetThreadId);
+    const resolvedThreadDate = requestedThreadDate || thread?.threadDate || threadDate;
+
+    const detail = await fetchJson(`/chat/threads/${encodeURIComponent(targetThreadId)}?thread_date=${resolvedThreadDate}`);
+    setView("chat");
+    setActiveThreadDate(resolvedThreadDate);
     setThreadId(targetThreadId);
     setPendingIntentId(detail.latest_response?.meta?.pending_intent_id || detail.pending_intent_id || null);
     setMessages((detail.messages || []).map((message) => ({
@@ -183,7 +350,7 @@ export default function App() {
     })));
     setOptions(getPendingOptionsFromResponse(detail.latest_response));
     setOptionsAllowFreeText(getPendingAllowFreeText(detail.latest_response));
-    setStoredActiveThreadId(threadDate, targetThreadId);
+    setStoredActiveThreadId(resolvedThreadDate, targetThreadId);
   }
 
   async function createNewThread({ activate = true, replaceThreads = false } = {}) {
@@ -229,6 +396,7 @@ export default function App() {
     });
 
     if (activate) {
+      setActiveThreadDate(threadDate);
       setThreadId(created.id);
       setMessages([]);
       setOptions([]);
@@ -236,7 +404,9 @@ export default function App() {
       setPendingIntentId(null);
       setStoredActiveThreadId(threadDate, created.id);
       await activateThread(created.id, [created, ...threadsRef.current.filter((item) => item.id !== created.id)]);
-      setView("chat");
+      if (!forceNonChatInitialView) {
+        setView("chat");
+      }
       inputRef.current?.focus();
     }
 
@@ -247,7 +417,12 @@ export default function App() {
     if (!threadsAvailableRef.current) return null;
 
     const currentThreadId = threadIdRef.current;
+    const currentActiveThreadDate = activeThreadDateRef.current;
     const currentThreads = threadsRef.current;
+
+    if (currentThreadId && currentActiveThreadDate && currentActiveThreadDate !== threadDate) {
+      return currentThreadId;
+    }
 
     if (currentThreadId && currentThreads.some((thread) => thread.id === currentThreadId)) {
       return currentThreadId;
@@ -304,7 +479,7 @@ export default function App() {
         body: JSON.stringify({
           message,
           ...(activeId ? { chat_thread_id: activeId } : {}),
-          thread_date: threadDate,
+          thread_date: activeThreadDateRef.current || threadDate,
           ...(pendingResponse ? { pending_response: pendingResponse } : {}),
         }),
       });
@@ -320,7 +495,7 @@ export default function App() {
         pendingIntentId: data.meta?.pending_intent_id || null,
       });
 
-      await refreshTodaySchedule();
+      await Promise.all([refreshTodaySchedule(), refreshWeekSchedule()]);
       if (threadsAvailable) {
         await refreshThreadCatalog({ preserveActive: true });
       }
@@ -359,7 +534,7 @@ export default function App() {
       return;
     }
     appendMessage("assistant", `Deleted task ${taskId}.`);
-    await Promise.all([refreshTodaySchedule(), refreshThreadCatalog(), refreshActiveThread()]);
+    await Promise.all([refreshTodaySchedule(), refreshWeekSchedule(), refreshThreadCatalog(), refreshActiveThread()]);
   }
 
   async function handleCompleteTask(taskId) {
@@ -369,11 +544,14 @@ export default function App() {
       return;
     }
     appendMessage("assistant", `Recorded completion for task ${taskId}.`);
-    await Promise.all([refreshTodaySchedule(), refreshThreadCatalog(), refreshActiveThread()]);
+    await Promise.all([refreshTodaySchedule(), refreshWeekSchedule(), refreshThreadCatalog(), refreshActiveThread()]);
   }
 
   async function handleDeleteThread(targetThreadId) {
-    const response = await fetch(`/chat/threads/${encodeURIComponent(targetThreadId)}?thread_date=${threadDate}`, {
+    const targetThreadDate = threadId === targetThreadId ? (activeThreadDateRef.current || threadDate) : (
+      threadsRef.current.find((thread) => thread.id === targetThreadId)?.threadDate || threadDate
+    );
+    const response = await fetch(`/chat/threads/${encodeURIComponent(targetThreadId)}?thread_date=${targetThreadDate}`, {
       method: "DELETE",
     });
     if (!response.ok) {
@@ -385,6 +563,7 @@ export default function App() {
     setThreads(remaining);
 
     if (!remaining.length) {
+      setActiveThreadDate(threadDate);
       setThreadId(null);
       setMessages([]);
       setOptions([]);
@@ -395,13 +574,16 @@ export default function App() {
     }
 
     if (threadId === targetThreadId) {
+      setActiveThreadDate(threadDate);
       await activateThread(remaining[0].id, remaining);
     }
+
+    await refreshRecentThreads();
   }
 
   async function refreshActiveThread() {
     if (!threadId) return;
-    await activateThread(threadId);
+    await activateThread(threadId, threadsRef.current, activeThreadDateRef.current || threadDate);
   }
 
   function handleRescheduleTask(taskTitle) {
@@ -414,12 +596,19 @@ export default function App() {
     setView("chat");
     setChatInput(template);
     requestAnimationFrame(() => {
-      inputRef.current?.focus();
-      const input = inputRef.current;
+      const input = inputRef.current || homeTextareaRef.current;
       if (input) {
+        input.focus();
         input.setSelectionRange(template.length, template.length);
       }
     });
+  }
+
+  function handleHomeTextareaKeyDown(event) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      handleSubmit();
+    }
   }
 
   function toggleSidebar() {
@@ -495,12 +684,12 @@ export default function App() {
                 type="button"
                 className={`sidebar-rail-button ${view === "today" ? "active" : ""}`}
                 onClick={() => setView("today")}
-                aria-label="Today's Tasks"
-                title="Today's Tasks"
+                aria-label="Recent Tasks"
+                title="Recent Tasks"
               >
                 <span className="sidebar-rail-button-main">
                   <IconToday />
-                  <span className="sidebar-rail-label">Today's Tasks</span>
+                  <span className="sidebar-rail-label">Recent Tasks</span>
                 </span>
               </button>
               <button
@@ -575,9 +764,9 @@ export default function App() {
                     ) : threads.map((thread) => (
                       <button
                         key={thread.id}
-                        className={`thread-item ${thread.id === threadId ? "active" : ""}`}
+                        className={`thread-item ${thread.id === threadId && activeThreadDate === thread.threadDate ? "active" : ""}`}
                         type="button"
-                        onClick={() => activateThread(thread.id)}
+                        onClick={() => activateThread(thread.id, threads, thread.threadDate)}
                       >
                         <span className="thread-item-top">
                           <span className="thread-item-title">{thread.title}</span>
@@ -629,9 +818,43 @@ export default function App() {
               <section className={`chat-stage ${hasConversation ? "chat-active" : ""}`}>
                 {!hasConversation ? (
                   <div id="chat-empty-state" className="chat-empty-state">
-                    <p className="eyebrow">Today's Planner</p>
-                    <h2>What should we organize today?</h2>
-                    <p className="muted">Ask to schedule, move, delete, or review your day, and I&apos;ll guide the next step with numbered options when needed.</p>
+                    <h2>What can I help you ship?</h2>
+                    <form id="chat-form-home" className="home-composer" onSubmit={handleSubmit}>
+                      <div className="home-composer-frame">
+                        <textarea
+                          ref={homeTextareaRef}
+                          id="chat-input"
+                          className="home-composer-textarea"
+                          placeholder="Ask v0 a question..."
+                          autoComplete="off"
+                          disabled={isSending}
+                          value={chatInput}
+                          onChange={(event) => {
+                            setChatInput(event.target.value);
+                            adjustHomeTextareaHeight();
+                          }}
+                          onKeyDown={handleHomeTextareaKeyDown}
+                        />
+                        <div className="home-composer-toolbar">
+                          <div className="home-composer-toolbar-right">
+                            <button type="submit" className="home-send-button" disabled={isSending} aria-label="Send">
+                              <ArrowUp size={18} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </form>
+                  </div>
+                ) : null}
+
+                {!hasConversation ? (
+                  <div className="quick-actions" id="quick-actions">
+                    {QUICK_ACTIONS.map((action) => (
+                      <button key={action.id} className="quick-action" type="button" onClick={() => handleQuickActionFill(action.template)}>
+                        <action.icon size={16} />
+                        {action.label}
+                      </button>
+                    ))}
                   </div>
                 ) : null}
 
@@ -670,10 +893,10 @@ export default function App() {
                 ) : null}
 
                 <form id="chat-form" className="chat-form chat-form-shell" onSubmit={handleSubmit}>
-                  <label className="chat-input-shell" htmlFor="chat-input">
+                  <label className="chat-input-shell" htmlFor="chat-input-inline">
                     <span className="chat-input-label">Planner Input</span>
                     <input
-                      id="chat-input"
+                      id="chat-input-inline"
                       ref={inputRef}
                       type="text"
                       placeholder="Ask anything about your schedule..."
@@ -688,15 +911,6 @@ export default function App() {
                   </button>
                 </form>
 
-                {!hasConversation ? (
-                  <div className="quick-actions" id="quick-actions">
-                    {QUICK_ACTIONS.map((action) => (
-                      <button key={action.id} className="quick-action" type="button" onClick={() => handleQuickActionFill(action.template)}>
-                        {action.label}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
               </section>
             </div>
           </section>
@@ -796,61 +1010,69 @@ export default function App() {
           </section>
 
           <section className={`view ${view === "today" ? "active" : ""}`} id="view-today">
-            <div className="hero">
-              <div>
-                <p className="eyebrow">Daily Operations</p>
-                <h2>Your day, arranged as an active timeline.</h2>
-                <p className="muted">See what is scheduled, what is pending, and which tasks still need a slot.</p>
+            <div className="calendar-shell panel">
+              <div className="calendar-month-label">{formatMonthYear(calendarWeekStart)}</div>
+              <div className="calendar-topbar">
+                <button
+                  type="button"
+                  className="calendar-nav-button"
+                  aria-label="Previous week"
+                  onClick={() => navigateCalendarWeek(-1)}
+                >
+                  <IconArrowLeft />
+                </button>
+                {calendarDays.map((day) => (
+                  <div className={`calendar-day-head ${day.date === threadDate ? "active" : ""}`} key={`head-${day.date}`}>
+                    <strong>{new Date(`${day.date}T00:00:00`).getDate()}</strong>
+                    <span>{formatWeekdayLabel(day.date)}</span>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  className="calendar-nav-button"
+                  aria-label="Next week"
+                  onClick={() => navigateCalendarWeek(1)}
+                >
+                  <IconArrowRight />
+                </button>
               </div>
-            </div>
 
-            <div className="today-layout">
-              <section className="panel">
-                <div className="panel-header">
-                  <div>
-                    <p className="eyebrow">Today</p>
-                    <h3>{formatLongDate(scheduleToday.date)} Schedule</h3>
-                  </div>
+              <div className="calendar-grid-shell" style={{ "--calendar-rows": calendarTimeSlots.length }}>
+                <div className="calendar-time-rail">
+                  {calendarTimeSlots.map((slot) => (
+                    <div className="calendar-time-slot" key={slot}>
+                      {slot}
+                    </div>
+                  ))}
                 </div>
-                <div className="timeline">
-                  {scheduleToday.tasks.length ? scheduleToday.tasks.map((task) => (
-                    <article className="timeline-item" key={task.id}>
-                      <div className="timeline-time">{task.start_time ? task.start_time.slice(0, 5) : "--:--"}</div>
-                      <div>
-                        <strong>{task.title}</strong>
-                        <p className="muted">{task.description || "No description"}</p>
-                        <small>
-                          <span className={`status-dot ${task.completed ? "status-complete" : task.start_time ? "status-pending" : "status-unscheduled"}`} />
-                          {task.completed ? "Completed" : task.start_time ? "Scheduled" : "Needs time"}
-                          {task.end_time ? ` until ${task.end_time.slice(0, 5)}` : ""}
-                        </small>
-                      </div>
-                    </article>
-                  )) : (
-                    <article className="timeline-item">
-                      <div className="timeline-time">Open</div>
-                      <div>
-                        <strong>No tasks scheduled yet.</strong>
-                        <p className="muted">Use the chat to create your first block for today.</p>
-                      </div>
-                    </article>
-                  )}
-                </div>
-              </section>
 
-              <section className="panel">
-                <div className="panel-header">
-                  <div>
-                    <p className="eyebrow">Daily Context</p>
-                    <h3>Energy and Focus</h3>
-                  </div>
+                <div className="calendar-grid">
+                  {calendarDays.map((day) => (
+                    <div className="calendar-column" key={`column-${day.date}`}>
+                      {calendarTimeSlots.map((slot) => (
+                        <div className="calendar-cell" key={`${day.date}-${slot}`} />
+                      ))}
+                    </div>
+                  ))}
+
+                  {scheduledCalendarEvents.map((event) => (
+                    <button
+                      key={event.id}
+                      type="button"
+                      className={`calendar-event tone-${event.tone} ${selectedCalendarEvent?.id === event.id ? "selected" : ""}`}
+                      style={event.style}
+                      onClick={() => setSelectedCalendarEventId(event.id)}
+                    >
+                      <span className="calendar-event-accent" />
+                      <strong>{event.title}</strong>
+                      <span>{event.timeLabel}</span>
+                      <small>{event.description}</small>
+                    </button>
+                  ))}
+
                 </div>
-                <div className="mini-stack">
-                  <article className="mini-card"><p className="eyebrow">Energy</p><strong>{scheduleToday.energy}</strong></article>
-                  <article className="mini-card"><p className="eyebrow">Message</p><strong>{scheduleToday.message}</strong></article>
-                  <article className="mini-card"><p className="eyebrow">Tasks</p><strong>{scheduleToday.tasks.length}</strong></article>
-                </div>
-              </section>
+                <div className="calendar-right-gutter" aria-hidden="true" />
+              </div>
             </div>
           </section>
         </main>
@@ -1293,6 +1515,54 @@ function formatTaskTime(task) {
   return end ? `${start}-${end}` : start;
 }
 
+function compareTasksByTime(a, b) {
+  const aValue = a.start_time ? timeStringToMinutes(a.start_time) : Number.MAX_SAFE_INTEGER;
+  const bValue = b.start_time ? timeStringToMinutes(b.start_time) : Number.MAX_SAFE_INTEGER;
+  return aValue - bValue;
+}
+
+function buildCalendarEvents(days, visibleSlots) {
+  const palette = ["violet", "cyan", "green", "amber", "blue"];
+  const visibleStart = timeStringToMinutes(visibleSlots[0]);
+  const visibleEnd = timeStringToMinutes(visibleSlots[visibleSlots.length - 1]) + 60;
+  const totalMinutes = visibleEnd - visibleStart;
+
+  return days.flatMap((day, dayIndex) => (
+    (day.tasks || [])
+      .filter((task) => task.start_time && task.end_time)
+      .map((task, taskIndex) => {
+        const startMinutes = timeStringToMinutes(task.start_time);
+        const endMinutes = timeStringToMinutes(task.end_time);
+        const clampedStart = Math.max(startMinutes, visibleStart);
+        const clampedEnd = Math.min(Math.max(endMinutes, clampedStart + 15), visibleEnd);
+        const topPercent = ((clampedStart - visibleStart) / totalMinutes) * 100;
+        const heightPercent = Math.max(((clampedEnd - clampedStart) / totalMinutes) * 100, 2.8);
+        const columnWidth = 100 / days.length;
+        const leftPercent = columnWidth * dayIndex;
+
+        return {
+          id: `${day.date}-${task.id}`,
+          date: day.date,
+          title: task.title,
+          description: task.description || "Scheduled task",
+          completed: task.completed,
+          tone: palette[(dayIndex + taskIndex) % palette.length],
+          timeLabel: `${task.start_time.slice(0, 5)}-${task.end_time.slice(0, 5)}`,
+          style: {
+            top: `calc(${topPercent}% + 6px)`,
+            left: `calc(${leftPercent}% + 6px)`,
+            width: `calc(${columnWidth}% - 12px)`,
+            height: `calc(${heightPercent}% - 6px)`,
+          },
+        };
+      })
+  ));
+}
+
+function getCalendarTimeSlots(days) {
+  return Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, "0")}:00`);
+}
+
 function formatPercent(value) {
   return `${Math.round((value || 0) * 100)}%`;
 }
@@ -1310,6 +1580,19 @@ function formatLongDate(isoDate) {
   return new Date(`${isoDate}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
 }
 
+function formatMonthYear(isoDate) {
+  return new Date(`${isoDate}T00:00:00`).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function formatWeekdayLabel(isoDate) {
+  return new Date(`${isoDate}T00:00:00`).toLocaleDateString(undefined, { weekday: "short" });
+}
+
+function formatWeekRangeLabel(startIsoDate) {
+  const range = getWeekRange(startIsoDate);
+  return `${formatLongDate(range[0])} – ${formatLongDate(range[range.length - 1])}`;
+}
+
 function formatThreadTimestamp(value) {
   return new Date(value).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
 }
@@ -1320,6 +1603,64 @@ function formatWorkspaceDate(date) {
     month: "short",
     day: "numeric",
   }).format(date);
+}
+
+function getRecentDateRange(baseIsoDate, count = 6) {
+  const start = new Date(`${baseIsoDate}T00:00:00`);
+  return Array.from({ length: count }, (_, index) => {
+    const next = new Date(start);
+    next.setDate(start.getDate() - (index + 1));
+    return next.toISOString().slice(0, 10);
+  });
+}
+
+function getWeekRange(baseIsoDate) {
+  const anchor = new Date(`${baseIsoDate}T00:00:00`);
+  const dayOfWeek = anchor.getDay();
+  const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+  const monday = new Date(anchor);
+  monday.setDate(anchor.getDate() + mondayOffset);
+
+  return Array.from({ length: 7 }, (_, index) => {
+    const current = new Date(monday);
+    current.setDate(monday.getDate() + index);
+    return current.toISOString().slice(0, 10);
+  });
+}
+
+function getViewFromPath(pathname) {
+  switch (pathname) {
+    case "/insights":
+      return "insights";
+    case "/recentactivities":
+      return "today";
+    case "/todayschats":
+    case "/":
+    default:
+      return "chat";
+  }
+}
+
+function addDays(baseIsoDate, dayOffset) {
+  const base = new Date(`${baseIsoDate}T00:00:00`);
+  base.setDate(base.getDate() + dayOffset);
+  return base.toISOString().slice(0, 10);
+}
+
+function IconArrowLeft() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="rail-icon">
+      <path d="m15 18-6-6 6-6" />
+    </svg>
+  );
+}
+
+function IconArrowRight() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="rail-icon">
+      <path d="m9 6 6 6-6 6" />
+    </svg>
+  );
 }
 
 function todayIso() {

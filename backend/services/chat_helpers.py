@@ -18,6 +18,7 @@ from app.schemas import (
 )
 from services.planner import get_historical_avg_duration, infer_task_type, rebalance_day
 from services.scheduling import extract_date_from_text, infer_duration_minutes, parse_time
+from services.thread_storage import derive_thread_identity
 from services.tools import create_task, get_schedule, infer_priority
 
 STOP_WORDS = {
@@ -725,18 +726,22 @@ def load_thread_state(db: Session, thread_key: str) -> dict:
 
 
 def save_thread_state(db: Session, thread_key: str, payload: dict) -> None:
+    derived_chat_thread_id, derived_thread_date = derive_thread_identity(
+        thread_key,
+        fallback_thread_date=payload.get("thread_date"),
+        fallback_chat_thread_id=payload.get("chat_thread_id"),
+    )
     rec = db.query(ConversationThread).filter(ConversationThread.thread_key == thread_key).first()
     if not rec:
         rec = ConversationThread(
             thread_key=thread_key,
-            thread_date=payload.get("thread_date") or date.today(),
-            chat_thread_id=payload.get("chat_thread_id"),
+            thread_date=derived_thread_date,
+            chat_thread_id=derived_chat_thread_id,
         )
         db.add(rec)
 
-    if payload.get("thread_date"):
-        rec.thread_date = payload["thread_date"]
-    rec.chat_thread_id = payload.get("chat_thread_id")
+    rec.thread_date = derived_thread_date
+    rec.chat_thread_id = derived_chat_thread_id
     rec.last_intent_type = payload.get("last_intent_type")
     rec.last_user_message = payload.get("last_user_message")
     rec.last_created_task_ids = _dump_ids(payload.get("last_created_task_ids", []))
@@ -760,10 +765,16 @@ def persist_chat_turn(
     if not user_message.strip():
         return
 
+    derived_chat_thread_id, derived_thread_date = derive_thread_identity(
+        thread_key,
+        fallback_thread_date=thread_date,
+        fallback_chat_thread_id=chat_thread_id,
+    )
+
     user_row = ConversationMessage(
         thread_key=thread_key,
-        thread_date=thread_date,
-        chat_thread_id=chat_thread_id,
+        thread_date=derived_thread_date,
+        chat_thread_id=derived_chat_thread_id,
         role="user",
         message_text=user_message,
         meta_text=None,
@@ -771,8 +782,8 @@ def persist_chat_turn(
     )
     assistant_row = ConversationMessage(
         thread_key=thread_key,
-        thread_date=thread_date,
-        chat_thread_id=chat_thread_id,
+        thread_date=derived_thread_date,
+        chat_thread_id=derived_chat_thread_id,
         role="assistant",
         message_text=response.message,
         meta_text=_summarize_response_for_log(response),
