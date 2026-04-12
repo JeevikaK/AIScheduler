@@ -7,6 +7,9 @@ from sqlalchemy import (
     Date,
     Time,
     DateTime,
+    ForeignKey,
+    Text,
+    UniqueConstraint,
 )
 from datetime import datetime
 
@@ -85,3 +88,91 @@ class ConversationMessage(Base):
     meta_text = Column(String, nullable=True)
     payload_json = Column(String, nullable=True)
     created_at = Column(DateTime, index=True, nullable=False, default=datetime.utcnow)
+
+
+class IntegrationAuthSession(Base):
+    __tablename__ = "integration_auth_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String, nullable=False, index=True)
+    state = Column(String, nullable=False, unique=True, index=True)
+    return_path = Column(String, nullable=False, default="/recentactivities")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class ConnectedAccount(Base):
+    __tablename__ = "connected_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    provider = Column(String, nullable=False, index=True)
+    external_account_id = Column(String, nullable=False, index=True)
+    email = Column(String, nullable=True, index=True)
+    access_token = Column(Text, nullable=False)
+    refresh_token = Column(Text, nullable=True)
+    token_expiry = Column(DateTime, nullable=True)
+    connection_status = Column(String, nullable=False, default="connected")
+    account_meta_json = Column(Text, nullable=True, default="{}")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("provider", "external_account_id", name="uq_connected_account_provider_external_id"),
+    )
+
+
+class ConnectedCalendar(Base):
+    __tablename__ = "connected_calendars"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(Integer, ForeignKey("connected_accounts.id"), nullable=False, index=True)
+    provider_calendar_id = Column(String, nullable=False, index=True)
+    calendar_name = Column(String, nullable=False)
+    color = Column(String, nullable=True)
+    selected_for_sync = Column(Boolean, nullable=False, default=False)
+    sync_state_json = Column(Text, nullable=True, default="{}")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "provider_calendar_id", name="uq_connected_calendar_account_provider_id"),
+    )
+
+
+class ExternalEvent(Base):
+    __tablename__ = "external_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(Integer, ForeignKey("connected_accounts.id"), nullable=False, index=True)
+    connected_calendar_id = Column(Integer, ForeignKey("connected_calendars.id"), nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    provider_event_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    location = Column(String, nullable=True)
+    start_at = Column(DateTime, nullable=False, index=True)
+    end_at = Column(DateTime, nullable=False, index=True)
+    timezone = Column(String, nullable=True)
+    all_day = Column(Boolean, nullable=False, default=False)
+    status = Column(String, nullable=False, default="confirmed")
+    cancelled = Column(Boolean, nullable=False, default=False)
+    etag = Column(String, nullable=True)
+    source_url = Column(String, nullable=True)
+    calendar_label = Column(String, nullable=True)
+    event_meta_json = Column(Text, nullable=True, default="{}")
+    last_synced_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("connected_calendar_id", "provider_event_id", name="uq_external_event_calendar_provider_id"),
+    )
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    setting_key = Column(String, nullable=False, unique=True, index=True)
+    setting_value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

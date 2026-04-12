@@ -1,18 +1,30 @@
 from agents.scheduler_agent import scheduler_agent
 from fastapi import FastAPI, Depends, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urlencode
 from sqlalchemy.orm import Session
 from app.db import get_db
-from app.schemas import ChatInput, ChatResponse, ChatThreadCreateResponse, ChatThreadDetailResponse, ChatThreadSummaryResponse, DailyScheduleResponse, DashboardOverviewResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput
+from app.schemas import ChatInput, ChatResponse, ChatThreadCreateResponse, ChatThreadDetailResponse, ChatThreadSummaryResponse, ConnectedAccountResponse, ConnectedCalendarSelectionInput, DailyScheduleResponse, DashboardOverviewResponse, IntegrationProviderResponse, IntegrationSettingsResponse, IntegrationSettingsUpdate, IntegrationStartResponse, IntegrationSyncResponse, MoodCreate, MoodResponse, ReflectionCreate, ReflectionResponse, TaskCreate, TaskResponse, TaskReflectionInput, WeeklyCalendarResponse
 from services.tools import create_chat_thread, create_mood, create_reflection, create_task, delete_chat_thread, get_chat_thread_detail, get_chat_threads, get_dashboard_overview, get_mood, get_tasks, get_reflection, get_today_schedule, get_schedule, complete_task, reflect_on_task, delete_task, clear_today_tasks, reschedule_overdue_tasks, get_summary
 from services.chat_helpers import (
     process_chat_request,
 )
+from services.calendar_integrations import (
+    disconnect_connected_account,
+    get_week_calendar_data,
+    handle_provider_callback,
+    list_available_providers,
+    list_connected_accounts,
+    select_account_calendars,
+    start_provider_auth,
+    sync_connected_account,
+)
+from services.app_settings import get_integration_settings, update_integration_settings
 
 app = FastAPI(title="AI Life Planner")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -40,8 +52,65 @@ def serve_frontend():
 @app.get("/todayschats")
 @app.get("/recentactivities")
 @app.get("/insights")
+@app.get("/settings")
 def serve_frontend_routes():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/integrations/providers", response_model=List[IntegrationProviderResponse])
+def get_integration_providers_endpoint(db: Session = Depends(get_db)):
+    return list_available_providers(db)
+
+
+@app.get("/settings/integrations", response_model=IntegrationSettingsResponse)
+def get_integration_settings_endpoint(db: Session = Depends(get_db)):
+    return get_integration_settings(db)
+
+
+@app.put("/settings/integrations", response_model=IntegrationSettingsResponse)
+def update_integration_settings_endpoint(payload: IntegrationSettingsUpdate, db: Session = Depends(get_db)):
+    return update_integration_settings(db, payload.model_dump())
+
+
+@app.post("/integrations/{provider}/start", response_model=IntegrationStartResponse)
+def start_integration_endpoint(provider: str, return_path: str = Query("/recentactivities"), db: Session = Depends(get_db)):
+    return start_provider_auth(provider, return_path, db)
+
+
+@app.get("/integrations/{provider}/callback")
+def integration_callback_endpoint(provider: str, state: str, code: Optional[str] = None, error: Optional[str] = None, db: Session = Depends(get_db)):
+    if error:
+        return RedirectResponse(url=f"/recentactivities?{urlencode({'integration_status': 'error', 'provider': provider, 'message': error})}")
+    if not code:
+        return RedirectResponse(url=f"/recentactivities?{urlencode({'integration_status': 'error', 'provider': provider, 'message': 'missing_code'})}")
+    return_path, account_id = handle_provider_callback(provider, state, code, db)
+    joiner = "&" if "?" in return_path else "?"
+    return RedirectResponse(url=f"{return_path}{joiner}{urlencode({'integration_status': 'connected', 'provider': provider, 'account_id': account_id})}")
+
+
+@app.get("/integrations/accounts", response_model=List[ConnectedAccountResponse])
+def get_connected_accounts_endpoint(db: Session = Depends(get_db)):
+    return list_connected_accounts(db)
+
+
+@app.post("/integrations/accounts/{account_id}/calendars/select", response_model=IntegrationSyncResponse)
+def select_calendars_endpoint(account_id: int, payload: ConnectedCalendarSelectionInput, db: Session = Depends(get_db)):
+    return select_account_calendars(account_id, payload.calendar_ids, payload.sync_immediately, db)
+
+
+@app.post("/integrations/accounts/{account_id}/sync", response_model=IntegrationSyncResponse)
+def sync_connected_account_endpoint(account_id: int, db: Session = Depends(get_db)):
+    return sync_connected_account(account_id, db)
+
+
+@app.delete("/integrations/accounts/{account_id}")
+def disconnect_connected_account_endpoint(account_id: int, db: Session = Depends(get_db)):
+    return disconnect_connected_account(account_id, db)
+
+
+@app.get("/calendar/week", response_model=WeeklyCalendarResponse)
+def get_calendar_week_endpoint(start_date: date = Query(...), timezone_name: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    return get_week_calendar_data(start_date, db, timezone_name)
 
 @app.post("/tasks", response_model=TaskResponse)
 def create_task_endpoint(

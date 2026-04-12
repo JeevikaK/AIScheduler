@@ -198,4 +198,104 @@ class DashboardOverviewResponse(BaseModel):
     best_productivity_window: str
     efficiency: EfficiencyMetrics
 
+
+class IntegrationProviderResponse(BaseModel):
+    provider: str
+    label: str
+    configured: bool
+    auth_path: str
+    status: str = "available"
+
+
+class IntegrationStartResponse(BaseModel):
+    provider: str
+    authorization_url: str
+
+
+class ConnectedCalendarSelectionInput(BaseModel):
+    calendar_ids: List[str] = Field(default_factory=list)
+    sync_immediately: bool = True
+
+
+class ConnectedCalendarResponse(BaseModel):
+    id: int
+    provider_calendar_id: str
+    calendar_name: str
+    color: Optional[str] = None
+    selected_for_sync: bool
+    last_synced_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class ConnectedAccountResponse(BaseModel):
+    id: int
+    provider: str
+    email: Optional[str] = None
+    external_account_id: str
+    connection_status: str
+    last_synced_at: Optional[datetime] = None
+    calendars: List[ConnectedCalendarResponse] = Field(default_factory=list)
+
+
+class IntegrationSyncResponse(BaseModel):
+    account_id: int
+    provider: str
+    synced_events: int
+    selected_calendars: int
+    status: str = "ok"
+
+
+class ExternalEventResponse(BaseModel):
+    id: int
+    account_id: int
+    connected_calendar_id: int
+    provider: str
+    provider_event_id: str
+    title: str
+    description: Optional[str] = None
+    location: Optional[str] = None
+    start_at: datetime
+    end_at: datetime
+    timezone: Optional[str] = None
+    all_day: bool = False
+    status: str
+    cancelled: bool = False
+    readonly: bool = True
+    calendar_label: Optional[str] = None
+    account_email: Optional[str] = None
+    color: Optional[str] = None
+    source_url: Optional[str] = None
+    organizer: Optional[str] = None
+    attendee_count: int = 0
+
+
+class WeeklyCalendarDayResponse(BaseModel):
+    date: date
+    tasks: List[TaskResponse] = Field(default_factory=list)
+    external_events: List[ExternalEventResponse] = Field(default_factory=list)
+
+
+class WeeklyCalendarResponse(BaseModel):
+    start_date: date
+    days: List[WeeklyCalendarDayResponse] = Field(default_factory=list)
+
+
+class IntegrationSettingsResponse(BaseModel):
+    app_base_url: str = ""
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    microsoft_tenant_id: str = ""
+
+
+class IntegrationSettingsUpdate(BaseModel):
+    app_base_url: str = ""
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    microsoft_tenant_id: str = ""
+
 Base.metadata.create_all(bind=engine)

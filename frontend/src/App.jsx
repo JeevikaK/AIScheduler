@@ -1,15 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
+  Check,
+  Clock3,
+  ChevronDown,
   FileUp,
   ImageIcon,
+  Link2,
   MonitorIcon,
+  RefreshCw,
   Shapes,
   UserRound,
 } from "lucide-react";
 import AnimatedShaderBackground from "./components/ui/animated-shader-background.jsx";
 
 const ACTIVE_THREAD_STORAGE_KEY = "ai_scheduler_active_threads_v2";
+const APP_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
 const QUICK_ACTIONS = [
   {
@@ -68,10 +74,25 @@ const INITIAL_WEEK = {
   days: [],
 };
 
+const INITIAL_INTEGRATION_NOTICE = {
+  tone: "neutral",
+  message: "",
+};
+
 const VIEW_TO_PATH = {
   chat: "/todayschats",
   insights: "/insights",
   today: "/recentactivities",
+  settings: "/settings",
+};
+
+const INITIAL_INTEGRATION_SETTINGS = {
+  app_base_url: "",
+  google_client_id: "",
+  google_client_secret: "",
+  microsoft_client_id: "",
+  microsoft_client_secret: "",
+  microsoft_tenant_id: "",
 };
 
 export default function App() {
@@ -96,6 +117,17 @@ export default function App() {
   const [weekSchedule, setWeekSchedule] = useState(INITIAL_WEEK);
   const [selectedCalendarEventId, setSelectedCalendarEventId] = useState(null);
   const [insights, setInsights] = useState(INITIAL_INSIGHTS);
+  const [integrationProviders, setIntegrationProviders] = useState([]);
+  const [connectedAccounts, setConnectedAccounts] = useState([]);
+  const [calendarScrollbarWidth, setCalendarScrollbarWidth] = useState(0);
+  const [integrationMenuOpen, setIntegrationMenuOpen] = useState(false);
+  const [integrationNotice, setIntegrationNotice] = useState(INITIAL_INTEGRATION_NOTICE);
+  const [integrationSettings, setIntegrationSettings] = useState(INITIAL_INTEGRATION_SETTINGS);
+  const [settingsNotice, setSettingsNotice] = useState(INITIAL_INTEGRATION_NOTICE);
+  const [isSavingSettings, setIsSavingSettings] = useState(false);
+  const [integrationBusyAccountId, setIntegrationBusyAccountId] = useState(null);
+  const [calendarPickerAccountId, setCalendarPickerAccountId] = useState(null);
+  const [calendarPickerSelection, setCalendarPickerSelection] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [threadsAvailable, setThreadsAvailable] = useState(true);
@@ -119,6 +151,8 @@ export default function App() {
   const messagesRef = useRef([]);
   const threadsAvailableRef = useRef(true);
   const homeTextareaRef = useRef(null);
+  const integrationMenuRef = useRef(null);
+  const calendarGridShellRef = useRef(null);
 
   const hasConversation = messages.length > 0;
   const workspaceDate = formatWorkspaceDate(new Date());
@@ -130,7 +164,7 @@ export default function App() {
     [calendarDays, calendarTimeSlots],
   );
   const selectedCalendarEvent = useMemo(
-    () => scheduledCalendarEvents.find((event) => event.id === selectedCalendarEventId) || scheduledCalendarEvents[0] || null,
+    () => scheduledCalendarEvents.find((event) => event.id === selectedCalendarEventId) || null,
     [scheduledCalendarEvents, selectedCalendarEventId],
   );
 
@@ -139,15 +173,54 @@ export default function App() {
       setSelectedCalendarEventId(null);
       return;
     }
-    if (!scheduledCalendarEvents.some((event) => event.id === selectedCalendarEventId)) {
-      setSelectedCalendarEventId(scheduledCalendarEvents[0].id);
+    if (selectedCalendarEventId && !scheduledCalendarEvents.some((event) => event.id === selectedCalendarEventId)) {
+      setSelectedCalendarEventId(null);
     }
   }, [scheduledCalendarEvents, selectedCalendarEventId]);
+
+  useLayoutEffect(() => {
+    const shell = calendarGridShellRef.current;
+    if (!shell || view !== "today") {
+      return undefined;
+    }
+
+    const updateScrollbarWidth = () => {
+      const nextWidth = Math.max(shell.offsetWidth - shell.clientWidth, 0);
+      setCalendarScrollbarWidth((currentWidth) => (currentWidth === nextWidth ? currentWidth : nextWidth));
+    };
+
+    updateScrollbarWidth();
+
+    const resizeObserver = typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(() => updateScrollbarWidth())
+      : null;
+
+    resizeObserver?.observe(shell);
+    shell.addEventListener("scroll", updateScrollbarWidth, { passive: true });
+    window.addEventListener("resize", updateScrollbarWidth);
+
+    return () => {
+      resizeObserver?.disconnect();
+      shell.removeEventListener("scroll", updateScrollbarWidth);
+      window.removeEventListener("resize", updateScrollbarWidth);
+    };
+  }, [view, calendarWeekStart, connectedAccounts.length, scheduledCalendarEvents.length]);
 
   useEffect(() => {
     boot();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!integrationMenuOpen) return undefined;
+    function handleOutsideClick(event) {
+      if (!integrationMenuRef.current?.contains(event.target)) {
+        setIntegrationMenuOpen(false);
+      }
+    }
+    window.addEventListener("mousedown", handleOutsideClick);
+    return () => window.removeEventListener("mousedown", handleOutsideClick);
+  }, [integrationMenuOpen]);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -216,7 +289,16 @@ export default function App() {
   }, [chatInput, adjustHomeTextareaHeight]);
 
   async function boot() {
-    await Promise.all([refreshInsights(), refreshTodaySchedule(), refreshWeekSchedule(getWeekRange(todayIso())[0]), refreshRecentThreads()]);
+    await Promise.all([
+      refreshInsights(),
+      refreshTodaySchedule(),
+      refreshWeekSchedule(getWeekRange(todayIso())[0]),
+      refreshRecentThreads(),
+      refreshIntegrationProviders(),
+      refreshConnectedAccounts(),
+      refreshIntegrationSettings(),
+    ]);
+    handleIntegrationQueryState();
     const targetThreadId = await refreshThreadCatalog({ preserveActive: false });
     if (!viewOverride && targetThreadId && messagesRef.current.length === 0) {
       await activateThread(targetThreadId);
@@ -242,20 +324,51 @@ export default function App() {
   }
 
   async function refreshWeekSchedule(baseWeekStart = calendarWeekStart) {
-    const range = getWeekRange(baseWeekStart);
-    const settled = await Promise.all(
-      range.map(async (day) => {
-        const items = await fetchJson(`/tasks?task_date=${day}`);
-        return {
-          date: day,
-          tasks: items.sort(compareTasksByTime),
-        };
-      }),
-    );
+    const data = await fetchJson(`/calendar/week?start_date=${baseWeekStart}&timezone_name=${encodeURIComponent(APP_TIME_ZONE)}`);
+    setWeekSchedule(data);
+  }
 
-    setWeekSchedule({
-      startDate: range[0],
-      days: settled,
+  async function refreshIntegrationProviders() {
+    const data = await fetchJson("/integrations/providers");
+    setIntegrationProviders(data);
+  }
+
+  async function refreshConnectedAccounts() {
+    const data = await fetchJson("/integrations/accounts");
+    setConnectedAccounts(data);
+    return data;
+  }
+
+  async function refreshIntegrationSettings() {
+    const data = await fetchJson("/settings/integrations");
+    setIntegrationSettings(data);
+    return data;
+  }
+
+  function handleIntegrationQueryState() {
+    if (!searchParams) return;
+    const integrationStatus = searchParams.get("integration_status");
+    const accountId = searchParams.get("account_id");
+    const provider = searchParams.get("provider");
+    const message = searchParams.get("message");
+
+    if (!integrationStatus) return;
+
+    if (integrationStatus === "connected") {
+      setView("today");
+      setIntegrationNotice({
+        tone: "success",
+        message: `${provider === "microsoft" ? "Outlook / Microsoft 365" : "Google Calendar"} connected. Choose which calendars to sync.`,
+      });
+      if (accountId) {
+        setCalendarPickerAccountId(Number(accountId));
+      }
+      return;
+    }
+
+    setIntegrationNotice({
+      tone: "error",
+      message: message ? `Calendar connection failed: ${message}` : "Calendar connection failed.",
     });
   }
 
@@ -264,6 +377,131 @@ export default function App() {
     setCalendarWeekStart(nextStart);
     setSelectedCalendarEventId(null);
     await refreshWeekSchedule(nextStart);
+  }
+
+  async function handleStartIntegration(provider) {
+    const payload = await fetchJson(
+      `/integrations/${provider}/start?return_path=${encodeURIComponent("/recentactivities")}`,
+      { method: "POST" },
+    );
+    window.location.href = payload.authorization_url;
+  }
+
+  function openCalendarPicker(account) {
+    setCalendarPickerAccountId(account.id);
+    setCalendarPickerSelection(
+      (account.calendars || [])
+        .filter((calendar) => calendar.selected_for_sync)
+        .map((calendar) => calendar.provider_calendar_id),
+    );
+  }
+
+  function toggleCalendarSelection(calendarId) {
+    setCalendarPickerSelection((current) => (
+      current.includes(calendarId)
+        ? current.filter((item) => item !== calendarId)
+        : [...current, calendarId]
+    ));
+  }
+
+  async function saveCalendarSelection(accountId) {
+    setIntegrationBusyAccountId(accountId);
+    try {
+      await fetchJson(`/integrations/accounts/${accountId}/calendars/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          calendar_ids: calendarPickerSelection,
+          sync_immediately: true,
+        }),
+      });
+      setIntegrationNotice({
+        tone: "success",
+        message: "Calendars synced successfully.",
+      });
+      setCalendarPickerAccountId(null);
+      await Promise.all([refreshConnectedAccounts(), refreshWeekSchedule(calendarWeekStart)]);
+    } catch (error) {
+      setIntegrationNotice({
+        tone: "error",
+        message: String(error.message || "Calendar sync failed."),
+      });
+    } finally {
+      setIntegrationBusyAccountId(null);
+    }
+  }
+
+  async function handleManualSync(accountId) {
+    setIntegrationBusyAccountId(accountId);
+    try {
+      await fetchJson(`/integrations/accounts/${accountId}/sync`, { method: "POST" });
+      setIntegrationNotice({
+        tone: "success",
+        message: "Calendar synced.",
+      });
+      await Promise.all([refreshConnectedAccounts(), refreshWeekSchedule(calendarWeekStart)]);
+    } catch (error) {
+      setIntegrationNotice({
+        tone: "error",
+        message: String(error.message || "Calendar sync failed."),
+      });
+    } finally {
+      setIntegrationBusyAccountId(null);
+    }
+  }
+
+  async function handleDisconnectAccount(accountId) {
+    setIntegrationBusyAccountId(accountId);
+    try {
+      await fetchJson(`/integrations/accounts/${accountId}`, { method: "DELETE" });
+      if (calendarPickerAccountId === accountId) {
+        setCalendarPickerAccountId(null);
+      }
+      setIntegrationNotice({
+        tone: "success",
+        message: "Calendar account disconnected.",
+      });
+      await Promise.all([refreshConnectedAccounts(), refreshWeekSchedule(calendarWeekStart)]);
+    } catch (error) {
+      setIntegrationNotice({
+        tone: "error",
+        message: String(error.message || "Could not disconnect account."),
+      });
+    } finally {
+      setIntegrationBusyAccountId(null);
+    }
+  }
+
+  async function handleSaveIntegrationSettings(event) {
+    event.preventDefault();
+    setIsSavingSettings(true);
+    try {
+      const data = await fetchJson("/settings/integrations", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(integrationSettings),
+      });
+      setIntegrationSettings(data);
+      setSettingsNotice({
+        tone: "success",
+        message: "Integration settings saved.",
+      });
+      await refreshIntegrationProviders();
+    } catch (error) {
+      setSettingsNotice({
+        tone: "error",
+        message: String(error.message || "Could not save integration settings."),
+      });
+    } finally {
+      setIsSavingSettings(false);
+    }
+  }
+
+  function updateIntegrationSetting(field, value) {
+    setIntegrationSettings((current) => ({
+      ...current,
+      [field]: value,
+    }));
   }
 
   async function refreshThreadCatalog({ preserveActive = true } = {}) {
@@ -694,6 +932,18 @@ export default function App() {
               </button>
               <button
                 type="button"
+                className={`sidebar-rail-button ${view === "settings" ? "active" : ""}`}
+                onClick={() => setView("settings")}
+                aria-label="Settings"
+                title="Settings"
+              >
+                <span className="sidebar-rail-button-main">
+                  <IconSettings />
+                  <span className="sidebar-rail-label">Settings</span>
+                </span>
+              </button>
+              <button
+                type="button"
                 className="sidebar-rail-button active-accent"
                 onClick={() => createNewThread({ activate: true })}
                 aria-label="New Chat"
@@ -1011,8 +1261,120 @@ export default function App() {
 
           <section className={`view ${view === "today" ? "active" : ""}`} id="view-today">
             <div className="calendar-shell panel">
-              <div className="calendar-month-label">{formatMonthYear(calendarWeekStart)}</div>
-              <div className="calendar-topbar">
+              <div className="calendar-header">
+                <div>
+                  <div className="calendar-month-label">{formatMonthYear(calendarWeekStart)}</div>
+                  <p className="calendar-range-label">{formatWeekRangeLabel(calendarWeekStart)}</p>
+                </div>
+                <div className="calendar-actions" ref={integrationMenuRef}>
+                  <button
+                    type="button"
+                    className="calendar-connect-button"
+                    onClick={() => setIntegrationMenuOpen((current) => !current)}
+                  >
+                    <Link2 size={15} />
+                    Connect calendar
+                    <ChevronDown size={15} />
+                  </button>
+                  {integrationMenuOpen ? (
+                    <div className="calendar-connect-menu">
+                      {integrationProviders.map((provider) => (
+                        <button
+                          key={provider.provider}
+                          type="button"
+                          className="calendar-connect-option"
+                          disabled={!provider.configured}
+                          onClick={() => handleStartIntegration(provider.provider)}
+                        >
+                          <span>{provider.label}</span>
+                          <small>{provider.configured ? "Connect" : "Not configured"}</small>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              {integrationNotice.message ? (
+                <div className={`integration-notice tone-${integrationNotice.tone}`}>
+                  {integrationNotice.message}
+                </div>
+              ) : null}
+              {connectedAccounts.length ? (
+                <div className="connected-accounts-row">
+                  {connectedAccounts.map((account) => (
+                    <article className="connected-account-card" key={account.id}>
+                      <div className="connected-account-copy">
+                        <strong>{account.provider === "microsoft" ? "Outlook / Microsoft 365" : "Google Calendar"}</strong>
+                        <span>{account.email || account.external_account_id}</span>
+                      </div>
+                      <div className="connected-account-actions">
+                        <button type="button" className="calendar-chip-button" onClick={() => openCalendarPicker(account)}>
+                          Choose calendars
+                        </button>
+                        <button
+                          type="button"
+                          className="calendar-chip-button"
+                          disabled={integrationBusyAccountId === account.id}
+                          onClick={() => handleManualSync(account.id)}
+                        >
+                          <RefreshCw size={13} />
+                          Sync now
+                        </button>
+                        <button
+                          type="button"
+                          className="calendar-chip-button danger"
+                          disabled={integrationBusyAccountId === account.id}
+                          onClick={() => handleDisconnectAccount(account.id)}
+                        >
+                          Disconnect
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+              {calendarPickerAccountId ? (
+                <div className="calendar-picker-panel">
+                  <div className="calendar-picker-header">
+                    <div>
+                      <strong>Select calendars to sync</strong>
+                      <span>Imported items will appear as read-only events in this calendar.</span>
+                    </div>
+                    <button type="button" className="calendar-chip-button" onClick={() => setCalendarPickerAccountId(null)}>
+                      Close
+                    </button>
+                  </div>
+                  <div className="calendar-picker-grid">
+                    {(connectedAccounts.find((account) => account.id === calendarPickerAccountId)?.calendars || []).map((calendar) => (
+                      <button
+                        key={calendar.provider_calendar_id}
+                        type="button"
+                        className={`calendar-picker-option ${calendarPickerSelection.includes(calendar.provider_calendar_id) ? "selected" : ""}`}
+                        onClick={() => toggleCalendarSelection(calendar.provider_calendar_id)}
+                      >
+                        <span className="calendar-picker-check">
+                          {calendarPickerSelection.includes(calendar.provider_calendar_id) ? <Check size={14} /> : null}
+                        </span>
+                        <span className="calendar-picker-name">{calendar.calendar_name}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="calendar-picker-actions">
+                    <button
+                      type="button"
+                      className="calendar-connect-button primary"
+                      disabled={integrationBusyAccountId === calendarPickerAccountId}
+                      onClick={() => saveCalendarSelection(calendarPickerAccountId)}
+                    >
+                      Save and sync
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              <div
+                className="calendar-topbar"
+                style={{ "--calendar-scrollbar-width": `${calendarScrollbarWidth}px` }}
+              >
                 <button
                   type="button"
                   className="calendar-nav-button"
@@ -1037,7 +1399,14 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="calendar-grid-shell" style={{ "--calendar-rows": calendarTimeSlots.length }}>
+              <div
+                ref={calendarGridShellRef}
+                className="calendar-grid-shell"
+                style={{
+                  "--calendar-rows": calendarTimeSlots.length,
+                  "--calendar-scrollbar-width": `${calendarScrollbarWidth}px`,
+                }}
+              >
                 <div className="calendar-time-rail">
                   {calendarTimeSlots.map((slot) => (
                     <div className="calendar-time-slot" key={slot}>
@@ -1059,21 +1428,164 @@ export default function App() {
                     <button
                       key={event.id}
                       type="button"
-                      className={`calendar-event tone-${event.tone} ${selectedCalendarEvent?.id === event.id ? "selected" : ""}`}
+                      className={`calendar-event tone-${event.tone} ${event.readonly ? "readonly" : ""} ${selectedCalendarEvent?.id === event.id ? "selected" : ""}`}
                       style={event.style}
                       onClick={() => setSelectedCalendarEventId(event.id)}
+                      aria-pressed={selectedCalendarEvent?.id === event.id}
                     >
                       <span className="calendar-event-accent" />
+                      {event.sourceLabel ? <small className="calendar-event-source">{event.sourceLabel}</small> : null}
                       <strong>{event.title}</strong>
-                      <span>{event.timeLabel}</span>
-                      <small>{event.description}</small>
+                      <span className="calendar-event-meta-line">
+                        <Clock3 size={12} strokeWidth={2} />
+                        <span>{event.timeLabel}</span>
+                      </span>
+                      {event.metaTag ? <span className="calendar-event-badge">{event.metaTag}</span> : null}
+                      {event.description ? <small>{event.description}</small> : null}
                     </button>
                   ))}
 
                 </div>
                 <div className="calendar-right-gutter" aria-hidden="true" />
               </div>
+              {selectedCalendarEvent ? (
+                <div className="calendar-event-detail-card">
+                  <div className="calendar-event-detail-header">
+                    <div>
+                      <p className="eyebrow">{selectedCalendarEvent.sourceLabel || "Calendar event"}</p>
+                      <h3>{selectedCalendarEvent.title}</h3>
+                      <p className="calendar-event-detail-time">{selectedCalendarEvent.dateLabel} · {selectedCalendarEvent.timeLabel}</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="calendar-chip-button"
+                      onClick={() => setSelectedCalendarEventId(null)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                  <div className="calendar-event-detail-meta">
+                    {selectedCalendarEvent.location ? (
+                      <span className="calendar-event-meta-pill">Location: {selectedCalendarEvent.location}</span>
+                    ) : null}
+                    {selectedCalendarEvent.organizer ? (
+                      <span className="calendar-event-meta-pill">Organizer: {selectedCalendarEvent.organizer}</span>
+                    ) : null}
+                    {selectedCalendarEvent.attendeeCount ? (
+                      <span className="calendar-event-meta-pill">{selectedCalendarEvent.attendeeCount} attendee{selectedCalendarEvent.attendeeCount === 1 ? "" : "s"}</span>
+                    ) : null}
+                    {selectedCalendarEvent.readonly ? (
+                      <span className="calendar-event-meta-pill">Read-only import</span>
+                    ) : null}
+                  </div>
+                  {selectedCalendarEvent.description ? (
+                    <div className="calendar-event-detail-copy">
+                      {selectedCalendarEvent.description.split(/\n+/).map((line, index) => (
+                        <p key={`${selectedCalendarEvent.id}-line-${index}`}>{line}</p>
+                      ))}
+                    </div>
+                  ) : null}
+                  {selectedCalendarEvent.links.length ? (
+                    <div className="calendar-event-links">
+                      {selectedCalendarEvent.links.map((link) => (
+                        <a
+                          key={link.href}
+                          className="calendar-event-link"
+                          href={link.href}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {link.label}
+                        </a>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
+          </section>
+
+          <section className={`view ${view === "settings" ? "active" : ""}`} id="view-settings">
+            <div className="hero">
+              <div>
+                <p className="eyebrow">Integration Settings</p>
+                <h2>Store your calendar provider keys in the app.</h2>
+                <p className="muted">These settings power Google Calendar and Outlook / Microsoft 365 sync. Save them here, then connect your calendars from the weekly calendar header.</p>
+              </div>
+            </div>
+
+            <section className="panel settings-panel">
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">OAuth Credentials</p>
+                  <h3>Calendar Providers</h3>
+                </div>
+              </div>
+              {settingsNotice.message ? (
+                <div className={`integration-notice tone-${settingsNotice.tone}`}>
+                  {settingsNotice.message}
+                </div>
+              ) : null}
+              <form className="settings-form" onSubmit={handleSaveIntegrationSettings}>
+                <div className="settings-grid">
+                  <label className="settings-field">
+                    <span>App Base URL</span>
+                    <input
+                      type="text"
+                      value={integrationSettings.app_base_url}
+                      onChange={(event) => updateIntegrationSetting("app_base_url", event.target.value)}
+                      placeholder="http://127.0.0.1:8000"
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>Google Client ID</span>
+                    <input
+                      type="text"
+                      value={integrationSettings.google_client_id}
+                      onChange={(event) => updateIntegrationSetting("google_client_id", event.target.value)}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>Google Client Secret</span>
+                    <input
+                      type="password"
+                      value={integrationSettings.google_client_secret}
+                      onChange={(event) => updateIntegrationSetting("google_client_secret", event.target.value)}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>Microsoft Client ID</span>
+                    <input
+                      type="text"
+                      value={integrationSettings.microsoft_client_id}
+                      onChange={(event) => updateIntegrationSetting("microsoft_client_id", event.target.value)}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>Microsoft Client Secret</span>
+                    <input
+                      type="password"
+                      value={integrationSettings.microsoft_client_secret}
+                      onChange={(event) => updateIntegrationSetting("microsoft_client_secret", event.target.value)}
+                    />
+                  </label>
+                  <label className="settings-field">
+                    <span>Microsoft Tenant ID</span>
+                    <input
+                      type="text"
+                      value={integrationSettings.microsoft_tenant_id}
+                      onChange={(event) => updateIntegrationSetting("microsoft_tenant_id", event.target.value)}
+                      placeholder="common"
+                    />
+                  </label>
+                </div>
+                <div className="settings-actions">
+                  <button type="submit" className="calendar-connect-button primary" disabled={isSavingSettings}>
+                    {isSavingSettings ? "Saving..." : "Save settings"}
+                  </button>
+                </div>
+              </form>
+            </section>
           </section>
         </main>
         </div>
@@ -1380,6 +1892,22 @@ function IconThreads() {
   );
 }
 
+function IconSettings() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="rail-icon">
+      <path d="M12 3v3" />
+      <path d="M12 18v3" />
+      <path d="M3 12h3" />
+      <path d="M18 12h3" />
+      <path d="m5.64 5.64 2.12 2.12" />
+      <path d="m16.24 16.24 2.12 2.12" />
+      <path d="m5.64 18.36 2.12-2.12" />
+      <path d="m16.24 7.76 2.12-2.12" />
+      <circle cx="12" cy="12" r="3.5" />
+    </svg>
+  );
+}
+
 function IconChevron() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="rail-icon sidebar-chevron-icon">
@@ -1527,40 +2055,130 @@ function buildCalendarEvents(days, visibleSlots) {
   const visibleEnd = timeStringToMinutes(visibleSlots[visibleSlots.length - 1]) + 60;
   const totalMinutes = visibleEnd - visibleStart;
 
-  return days.flatMap((day, dayIndex) => (
-    (day.tasks || [])
+  return days.flatMap((day, dayIndex) => {
+    const localEvents = (day.tasks || [])
       .filter((task) => task.start_time && task.end_time)
-      .map((task, taskIndex) => {
-        const startMinutes = timeStringToMinutes(task.start_time);
-        const endMinutes = timeStringToMinutes(task.end_time);
-        const clampedStart = Math.max(startMinutes, visibleStart);
-        const clampedEnd = Math.min(Math.max(endMinutes, clampedStart + 15), visibleEnd);
-        const topPercent = ((clampedStart - visibleStart) / totalMinutes) * 100;
-        const heightPercent = Math.max(((clampedEnd - clampedStart) / totalMinutes) * 100, 2.8);
-        const columnWidth = 100 / days.length;
-        const leftPercent = columnWidth * dayIndex;
+      .map((task, taskIndex) => buildEventCard({
+        id: `${day.date}-${task.id}`,
+        rawDate: day.date,
+        dayIndex,
+        daysCount: days.length,
+        visibleStart,
+        visibleEnd,
+        totalMinutes,
+        title: task.title,
+        description: task.description || "Scheduled task",
+        startMinutes: timeStringToMinutes(task.start_time),
+        endMinutes: timeStringToMinutes(task.end_time),
+        tone: palette[(dayIndex + taskIndex) % palette.length],
+        readonly: false,
+        timeLabel: `${task.start_time.slice(0, 5)}-${task.end_time.slice(0, 5)}`,
+      }));
 
-        return {
-          id: `${day.date}-${task.id}`,
-          date: day.date,
-          title: task.title,
-          description: task.description || "Scheduled task",
-          completed: task.completed,
-          tone: palette[(dayIndex + taskIndex) % palette.length],
-          timeLabel: `${task.start_time.slice(0, 5)}-${task.end_time.slice(0, 5)}`,
-          style: {
-            top: `calc(${topPercent}% + 6px)`,
-            left: `calc(${leftPercent}% + 6px)`,
-            width: `calc(${columnWidth}% - 12px)`,
-            height: `calc(${heightPercent}% - 6px)`,
-          },
-        };
-      })
-  ));
+    const externalEvents = (day.external_events || [])
+      .map((event, eventIndex) => {
+        const startMinutes = timeStringToMinutesFromDateTime(event.start_at);
+        const endMinutes = timeStringToMinutesFromDateTime(event.end_at);
+        return buildEventCard({
+          id: `external-${event.id}`,
+          rawDate: day.date,
+          dayIndex,
+          daysCount: days.length,
+          visibleStart,
+          visibleEnd,
+          totalMinutes,
+          title: event.title,
+          description: event.description || event.calendar_label || event.account_email || "Imported calendar event",
+          startMinutes,
+          endMinutes: Math.max(endMinutes, startMinutes + 15),
+          tone: event.provider === "google" ? "google" : "microsoft",
+          readonly: true,
+          sourceLabel: event.provider === "google" ? "Google" : "Outlook",
+          timeLabel: `${formatDateTimeClock(event.start_at)}-${formatDateTimeClock(event.end_at)}`,
+          location: event.location,
+          organizer: event.organizer,
+          attendeeCount: event.attendee_count,
+          sourceUrl: event.source_url,
+          metaTag: event.attendee_count
+            ? `${event.attendee_count} attendee${event.attendee_count === 1 ? "" : "s"}`
+            : (event.location || event.organizer || (event.provider === "google" ? "Google Calendar" : "Outlook")),
+          zIndex: 4 + eventIndex,
+        });
+      });
+
+    return [...localEvents, ...externalEvents];
+  });
+}
+
+function buildEventCard({
+  id,
+  rawDate,
+  dayIndex,
+  daysCount,
+  visibleStart,
+  visibleEnd,
+  totalMinutes,
+  title,
+  description,
+  startMinutes,
+  endMinutes,
+  tone,
+  readonly,
+  sourceLabel = "",
+  timeLabel,
+  location = "",
+  organizer = "",
+  attendeeCount = 0,
+  sourceUrl = "",
+  metaTag = "",
+  zIndex = 2,
+}) {
+  const clampedStart = Math.max(startMinutes, visibleStart);
+  const clampedEnd = Math.min(Math.max(endMinutes, clampedStart + 15), visibleEnd);
+  const topPercent = ((clampedStart - visibleStart) / totalMinutes) * 100;
+  const heightPercent = Math.max(((clampedEnd - clampedStart) / totalMinutes) * 100, 2.8);
+  const columnWidth = 100 / daysCount;
+  const leftPercent = columnWidth * dayIndex;
+
+  return {
+    id,
+    title,
+    description,
+    tone,
+    readonly,
+    sourceLabel,
+    timeLabel,
+    dateLabel: rawDate ? formatLongDate(rawDate) : "",
+    location,
+    organizer,
+    attendeeCount,
+    sourceUrl,
+    metaTag,
+    links: buildEventLinks({ description, sourceUrl, location }),
+    style: {
+      top: `calc(${topPercent}% + 6px)`,
+      left: `calc(${leftPercent}% + 6px)`,
+      width: `calc(${columnWidth}% - 12px)`,
+      height: `max(calc(${heightPercent}% - 6px), 112px)`,
+      zIndex,
+    },
+  };
 }
 
 function getCalendarTimeSlots(days) {
   return Array.from({ length: 24 }, (_, hour) => `${String(hour).padStart(2, "0")}:00`);
+}
+
+function timeStringToMinutesFromDateTime(value) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: APP_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(value));
+  const hours = Number(parts.find((part) => part.type === "hour")?.value || "0");
+  const minutes = Number(parts.find((part) => part.type === "minute")?.value || "0");
+  return (hours * 60) + minutes;
 }
 
 function formatPercent(value) {
@@ -1595,6 +2213,31 @@ function formatWeekRangeLabel(startIsoDate) {
 
 function formatThreadTimestamp(value) {
   return new Date(value).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function formatDateTimeClock(value) {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: APP_TIME_ZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(value));
+}
+
+function buildEventLinks({ description = "", sourceUrl = "", location = "" }) {
+  const matches = new Set();
+  const sources = [description, location, sourceUrl].filter(Boolean);
+  for (const source of sources) {
+    const found = String(source).match(/https?:\/\/[^\s)]+/g) || [];
+    found.forEach((item) => matches.add(item));
+  }
+  if (sourceUrl) {
+    matches.add(sourceUrl);
+  }
+  return [...matches].map((href, index) => ({
+    href,
+    label: index === 0 ? "Open link" : `Open link ${index + 1}`,
+  }));
 }
 
 function formatWorkspaceDate(date) {
@@ -1634,6 +2277,8 @@ function getViewFromPath(pathname) {
       return "insights";
     case "/recentactivities":
       return "today";
+    case "/settings":
+      return "settings";
     case "/todayschats":
     case "/":
     default:
